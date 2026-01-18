@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+Kite Connect Auto-Login using Selenium
+Automates the login process to get access token daily.
+
+DISCLAIMER: Automating login may be against Zerodha's Terms of Service.
+Use at your own risk.
+
+Requirements:
+    pip install selenium webdriver-manager pyotp
+
+Setup:
+    1. Set your credentials in .env file or environment variables
+    2. If you have 2FA TOTP, add your TOTP secret key
+"""
+import os
+import time
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    WEBDRIVER_MANAGER_AVAILABLE = True
+except ImportError:
+    WEBDRIVER_MANAGER_AVAILABLE = False
+
+try:
+    import pyotp
+    PYOTP_AVAILABLE = True
+except ImportError:
+    PYOTP_AVAILABLE = False
+
+try:
+    from kiteconnect import KiteConnect
+    KITE_AVAILABLE = True
+except ImportError:
+    KITE_AVAILABLE = False
+
+try:
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+except ImportError:
+    IST = None
+
+
+BASE_DIR = Path(__file__).parent
+
+
+def now_ist():
+    if IST:
+        return datetime.now(IST)
+    return datetime.now()
+
+
+def log(message: str):
+    timestamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+class KiteAutoLogin:
+    """
+    Automates Kite Connect login using Selenium.
+    Handles:
+    - Username/Password login
+    - TOTP 2FA (if configured)
+    - Request token extraction
+    - Access token generation
+    """
+    
+    def __init__(self, 
+                 api_key: str,
+                 api_secret: str,
+                 user_id: str,
+                 password: str,
+                 totp_secret: Optional[str] = None,
+                 headless: bool = True):
+        """
+        Initialize auto-login.
+        
+        Args:
+            api_key: Kite Connect API key
+            api_secret: Kite Connect API secret
+            user_id: Zerodha user ID (e.g., AB1234)
+            password: Zerodha password
+            totp_secret: TOTP secret key for 2FA (optional)
+            headless: Run browser in headless mode
+        """
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.user_id = user_id
+        self.password = password
+        self.totp_secret = totp_secret
+        self.headless = headless
+        
+        self.driver = None
+        self.kite = None
+        self.access_token = None
+    
+    def _setup_driver(self):
+        """Setup Chrome WebDriver."""
+        if not SELENIUM_AVAILABLE:
+            raise ImportError("selenium not installed. Run: pip install selenium")
+        
+        options = Options()
+        
+        if self.headless:
+            options.add_argument("--headless=new")
+        
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        
+        if WEBDRIVER_MANAGER_AVAILABLE:
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+        else:
+            self.driver = webdriver.Chrome(options=options)
+        
+        # Stealth settings
+        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    
+    def _get_totp(self) -> str:
+        """Generate TOTP code."""
+        if not PYOTP_AVAILABLE:
+            raise ImportError("pyotp not installed. Run: pip install pyotp")
+        
+        if not self.totp_secret:
+            raise ValueError("TOTP secret not provided")
+        
+        totp = pyotp.TOTP(self.totp_secret)
+        return totp.now()
+    
+    def login(self) -> Optional[str]:
+        """
+        Perform automated login and return access token.
+        
+        Returns:
+            Access token string or None if failed
+        """
+        if not KITE_AVAILABLE:
+            log("❌ kiteconnect not installed")
+            return None
+        
+        try:
+            log("🚀 Starting Kite auto-login...")
+            
+            # Initialize Kite
+            self.kite = KiteConnect(api_key=self.api_key)
+            login_url = self.kite.login_url()
+            
+            # Setup browser
+            self._setup_driver()
+            log("✅ Browser initialized")
+            
+            # Navigate to login page
+            self.driver.get(login_url)
+            log(f"📍 Navigated to login page")
+            
+            # Wait for login form
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.ID, "userid"))
+            )
+            
+            # Enter user ID
+            userid_input = self.driver.find_element(By.ID, "userid")
+            userid_input.clear()
+            userid_input.send_keys(self.user_id)
+            log(f"📝 Entered user ID: {self.user_id}")
+            
+            # Enter password
+            password_input = self.driver.find_element(By.ID, "password")
+            password_input.clear()
+            password_input.send_keys(self.password)
+            log("📝 Entered password")
+            
+            # Click login button
+            login_button = self.driver.find_element(By.XPATH, "//button[@type='submit']")
+            login_button.click()
+            log("🔄 Clicked login button")
+            
+            # Wait for TOTP page or redirect
+            time.sleep(2)
+            
+            # Check for TOTP input
+            try:
+                totp_input = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//input[@type='text' or @type='number']"))
+                )
+                
+                if self.totp_secret:
+                    totp_code = self._get_totp()
+                    totp_input.clear()
+                    totp_input.send_keys(totp_code)
+                    log(f"📝 Entered TOTP code")
+                    
+                    # Auto-submit usually happens, wait for redirect
+                    time.sleep(3)
+                else:
+                    log("⚠️ TOTP required but no secret provided")
+                    # Wait for manual input
+                    log("Please enter TOTP manually in the browser...")
+                    time.sleep(30)
+                    
+            except TimeoutException:
+                log("ℹ️ No TOTP required or already redirected")
+            
+            # Wait for redirect with request_token
+            log("⏳ Waiting for redirect...")
+            
+            for _ in range(30):  # Wait up to 30 seconds
+                current_url = self.driver.current_url
+                
+                if "request_token=" in current_url:
+                    # Extract request token
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(current_url)
+                    params = parse_qs(parsed.query)
+                    
+                    if "request_token" in params:
+                        request_token = params["request_token"][0]
+                        log(f"✅ Got request token: {request_token[:10]}...")
+                        
+                        # Generate access token
+                        data = self.kite.generate_session(request_token, self.api_secret)
+                        self.access_token = data["access_token"]
+                        self.kite.set_access_token(self.access_token)
+                        
+                        log(f"✅ Access token generated successfully!")
+                        log(f"👤 User: {data.get('user_name', 'N/A')}")
+                        
+                        # Save token
+                        self._save_token(data)
+                        
+                        return self.access_token
+                
+                time.sleep(1)
+            
+            log("❌ Timeout waiting for request token")
+            return None
+            
+        except Exception as e:
+            log(f"❌ Login failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+        finally:
+            if self.driver:
+                self.driver.quit()
+                log("🔒 Browser closed")
+    
+    def _save_token(self, data: dict):
+        """Save access token to file."""
+        token_file = BASE_DIR / "access_token.json"
+        
+        token_data = {
+            "access_token": data["access_token"],
+            "user_id": data.get("user_id"),
+            "user_name": data.get("user_name"),
+            "generated_at": now_ist().isoformat(),
+            "expires_at": now_ist().replace(hour=6, minute=0, second=0).isoformat()
+        }
+        
+        with open(token_file, "w") as f:
+            json.dump(token_data, f, indent=2)
+        
+        log(f"💾 Token saved to {token_file}")
+    
+    def get_saved_token(self) -> Optional[str]:
+        """Get saved access token if still valid."""
+        token_file = BASE_DIR / "access_token.json"
+        
+        if not token_file.exists():
+            return None
+        
+        try:
+            with open(token_file, "r") as f:
+                data = json.load(f)
+            
+            # Check if token is from today (tokens expire at 6 AM next day)
+            generated = datetime.fromisoformat(data["generated_at"])
+            now = now_ist()
+            
+            # Token is valid if generated today and current time is before 6 AM next day
+            if generated.date() == now.date() or \
+               (generated.date() == (now - timedelta(days=1)).date() and now.hour < 6):
+                return data["access_token"]
+            
+            return None
+            
+        except Exception:
+            return None
+
+
+def load_credentials():
+    """Load credentials from api_key.txt and .env or environment."""
+    # Load API key and secret from api_key.txt
+    api_file = BASE_DIR / "api_key.txt"
+    if api_file.exists():
+        lines = api_file.read_text().strip().split("\n")
+        api_key = lines[0].strip()
+        api_secret = lines[1].strip()
+    else:
+        api_key = os.environ.get("KITE_API_KEY", "")
+        api_secret = os.environ.get("KITE_API_SECRET", "")
+    
+    # Load login credentials from .env or environment
+    user_id = os.environ.get("KITE_USER_ID", "")
+    password = os.environ.get("KITE_PASSWORD", "")
+    totp_secret = os.environ.get("KITE_TOTP_SECRET", "")
+    
+    # Try loading from .env file
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                
+                if key == "KITE_USER_ID":
+                    user_id = value
+                elif key == "KITE_PASSWORD":
+                    password = value
+                elif key == "KITE_TOTP_SECRET":
+                    totp_secret = value
+    
+    return {
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "user_id": user_id,
+        "password": password,
+        "totp_secret": totp_secret or None
+    }
+
+
+def main():
+    """Test auto-login."""
+    print("\n" + "=" * 60)
+    print("🔐 KITE AUTO-LOGIN TEST")
+    print("=" * 60)
+    
+    # Check dependencies
+    missing = []
+    if not SELENIUM_AVAILABLE:
+        missing.append("selenium")
+    if not WEBDRIVER_MANAGER_AVAILABLE:
+        missing.append("webdriver-manager")
+    if not PYOTP_AVAILABLE:
+        missing.append("pyotp")
+    if not KITE_AVAILABLE:
+        missing.append("kiteconnect")
+    
+    if missing:
+        print(f"❌ Missing packages: {', '.join(missing)}")
+        print(f"Run: pip install {' '.join(missing)}")
+        return
+    
+    # Load credentials
+    creds = load_credentials()
+    
+    if not creds["user_id"] or not creds["password"]:
+        print("❌ Missing credentials. Create .env file with:")
+        print("   KITE_USER_ID=your_user_id")
+        print("   KITE_PASSWORD=your_password")
+        print("   KITE_TOTP_SECRET=your_totp_secret (optional)")
+        return
+    
+    print(f"User ID: {creds['user_id']}")
+    print(f"TOTP: {'Configured' if creds['totp_secret'] else 'Not configured'}")
+    print("=" * 60)
+    
+    # Perform login
+    auto_login = KiteAutoLogin(
+        api_key=creds["api_key"],
+        api_secret=creds["api_secret"],
+        user_id=creds["user_id"],
+        password=creds["password"],
+        totp_secret=creds["totp_secret"],
+        headless=False  # Set to True for server deployment
+    )
+    
+    token = auto_login.login()
+    
+    if token:
+        print("\n✅ Auto-login successful!")
+        print(f"Access token: {token[:20]}...")
+    else:
+        print("\n❌ Auto-login failed")
+
+
+if __name__ == "__main__":
+    main()

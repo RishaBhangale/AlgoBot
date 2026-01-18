@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+Telegram Bot Integration for Trading Notifications
+Sends real-time trade alerts and daily summaries.
+
+Setup:
+1. Create a Telegram bot via @BotFather
+2. Get your chat ID via @userinfobot
+3. Add credentials to .env
+"""
+import os
+import json
+import requests
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, List
+
+try:
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+except ImportError:
+    IST = None
+
+
+BASE_DIR = Path(__file__).parent
+
+
+def now_ist():
+    if IST:
+        return datetime.now(IST)
+    return datetime.now()
+
+
+class TelegramNotifier:
+    """
+    Sends trading notifications to Telegram.
+    
+    Features:
+    - Real-time trade alerts (entry/exit)
+    - Position status updates
+    - Daily P&L summary
+    """
+    
+    def __init__(self, bot_token: str = None, chat_id: str = None):
+        """
+        Initialize Telegram notifier.
+        
+        Args:
+            bot_token: Telegram bot token from @BotFather
+            chat_id: Your Telegram chat ID
+        """
+        self.bot_token = bot_token or self._load_from_env("TELEGRAM_BOT_TOKEN")
+        self.chat_id = chat_id or self._load_from_env("TELEGRAM_CHAT_ID")
+        self.enabled = bool(self.bot_token and self.chat_id)
+        
+        if not self.enabled:
+            print("⚠️ Telegram notifications disabled (missing credentials)")
+    
+    def _load_from_env(self, key: str) -> Optional[str]:
+        """Load value from environment or .env file."""
+        value = os.environ.get(key)
+        if value:
+            return value
+        
+        env_file = BASE_DIR / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'")
+        return None
+    
+    def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
+        """
+        Send a message to Telegram.
+        
+        Args:
+            message: Message text (supports HTML formatting)
+            parse_mode: "HTML" or "Markdown"
+        
+        Returns:
+            True if sent successfully
+        """
+        if not self.enabled:
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": parse_mode
+            }
+            response = requests.post(url, data=data, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Telegram error: {e}")
+            return False
+    
+    def notify_bot_start(self, securities: List[str]):
+        """Notify that bot has started."""
+        message = f"""
+🚀 <b>SUPERTREND BOT STARTED</b>
+
+📅 Date: {now_ist().strftime("%Y-%m-%d")}
+⏰ Time: {now_ist().strftime("%H:%M:%S")} IST
+📊 Securities: {", ".join(securities)}
+
+Strategy: Supertrend (ATR:10, Mult:3.0)
+Timeframe: 5 minutes
+
+<i>Waiting for market signals...</i>
+"""
+        self.send_message(message)
+    
+    def notify_trade_entry(self, security: str, option_type: str, strike: int,
+                           entry_price: float, target: float, sl: float,
+                           quantity: int, signal: str):
+        """Notify new trade entry."""
+        emoji = "🟢" if signal == "BUY" else "🔴"
+        direction = "BULLISH" if signal == "BUY" else "BEARISH"
+        
+        message = f"""
+{emoji} <b>NEW TRADE - {security}</b>
+
+📊 Signal: {direction}
+🎯 Type: {option_type}
+💰 Strike: {strike}
+
+<b>Entry:</b> ₹{entry_price:.2f}
+<b>Target:</b> ₹{target:.2f} (+{((target/entry_price - 1)*100):.1f}%)
+<b>SL:</b> ₹{sl:.2f} (-{((1 - sl/entry_price)*100):.1f}%)
+<b>Qty:</b> {quantity}
+
+⏰ {now_ist().strftime("%H:%M:%S")} IST
+"""
+        self.send_message(message)
+    
+    def notify_trade_exit(self, security: str, option_type: str, strike: int,
+                          entry_price: float, exit_price: float, pnl: float,
+                          reason: str):
+        """Notify trade exit."""
+        emoji = "✅" if pnl > 0 else "🛑"
+        pnl_emoji = "📈" if pnl > 0 else "📉"
+        
+        message = f"""
+{emoji} <b>TRADE CLOSED - {security}</b>
+
+🎯 Type: {option_type} {strike}
+📍 Reason: {reason}
+
+<b>Entry:</b> ₹{entry_price:.2f}
+<b>Exit:</b> ₹{exit_price:.2f}
+{pnl_emoji} <b>P&L:</b> ₹{pnl:+,.2f}
+
+⏰ {now_ist().strftime("%H:%M:%S")} IST
+"""
+        self.send_message(message)
+    
+    def notify_daily_summary(self, date: str, securities_data: Dict, total_pnl: float):
+        """Send daily trading summary."""
+        pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+        status_emoji = "✅" if total_pnl >= 0 else "⚠️"
+        
+        summary_lines = []
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
+        
+        for symbol, data in securities_data.items():
+            trades = data.get("trades", 0)
+            pnl = data.get("pnl", 0)
+            wins = data.get("wins", 0)
+            losses = data.get("losses", 0)
+            
+            total_trades += trades
+            total_wins += wins
+            total_losses += losses
+            
+            sym_emoji = "📈" if pnl >= 0 else "📉"
+            summary_lines.append(f"  {symbol}: {trades} trades | W:{wins} L:{losses} | {sym_emoji} ₹{pnl:+,.2f}")
+        
+        win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+        
+        message = f"""
+{status_emoji} <b>DAILY SUMMARY - {date}</b>
+
+━━━━━━━━━━━━━━━━━━━━━━
+<b>Securities:</b>
+{chr(10).join(summary_lines)}
+
+━━━━━━━━━━━━━━━━━━━━━━
+<b>Total Trades:</b> {total_trades}
+<b>Winners:</b> {total_wins}
+<b>Losers:</b> {total_losses}
+<b>Win Rate:</b> {win_rate:.1f}%
+
+{pnl_emoji} <b>TOTAL P&L:</b> ₹{total_pnl:+,.2f}
+━━━━━━━━━━━━━━━━━━━━━━
+
+<i>Session ended at {now_ist().strftime("%H:%M:%S")} IST</i>
+"""
+        self.send_message(message)
+    
+    def notify_error(self, error: str):
+        """Notify about an error."""
+        message = f"""
+⚠️ <b>BOT ERROR</b>
+
+{error}
+
+⏰ {now_ist().strftime("%H:%M:%S")} IST
+"""
+        self.send_message(message)
+    
+    def notify_market_waiting(self, hours: int, mins: int):
+        """Notify that bot is waiting for market."""
+        message = f"""
+⏳ <b>WAITING FOR MARKET</b>
+
+Market opens in: {hours}h {mins}m
+Will auto-login and start trading.
+
+<i>{now_ist().strftime("%Y-%m-%d %H:%M:%S")} IST</i>
+"""
+        self.send_message(message)
+
+
+def test_telegram():
+    """Test Telegram connection."""
+    print("\n" + "=" * 50)
+    print("🔔 TELEGRAM NOTIFICATION TEST")
+    print("=" * 50)
+    
+    notifier = TelegramNotifier()
+    
+    if not notifier.enabled:
+        print("❌ Telegram not configured")
+        print("Add to .env:")
+        print("  TELEGRAM_BOT_TOKEN=your_token")
+        print("  TELEGRAM_CHAT_ID=your_chat_id")
+        print("\nHow to get these:")
+        print("1. Create bot: Message @BotFather on Telegram")
+        print("2. Get chat ID: Message @userinfobot")
+        return
+    
+    print("Sending test message...")
+    success = notifier.send_message("🧪 <b>Test message from Supertrend Bot!</b>\n\nIf you see this, Telegram is configured correctly.")
+    
+    if success:
+        print("✅ Test message sent!")
+    else:
+        print("❌ Failed to send message")
+
+
+if __name__ == "__main__":
+    test_telegram()
