@@ -85,6 +85,7 @@ app = FastAPI(
 # --- HEALTH CHECK ROUTES ---
 
 @app.get("/", response_class=PlainTextResponse)
+@app.head("/")
 async def health_check():
     """Main health check endpoint for UptimeRobot."""
     bot_status["last_health_check"] = now_ist().isoformat()
@@ -92,9 +93,16 @@ async def health_check():
 
 
 @app.get("/ping", response_class=PlainTextResponse)
+@app.head("/ping")
 async def ping():
     """Simple ping endpoint."""
     return "pong"
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Return empty favicon to avoid 404s."""
+    return ""
 
 
 @app.get("/status")
