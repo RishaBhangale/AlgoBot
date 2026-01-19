@@ -44,7 +44,7 @@ def add_log(message: str):
     """Add log message with timestamp."""
     timestamp = now_ist().strftime("%H:%M:%S")
     log_entry = f"[{timestamp}] {message}"
-    print(log_entry)
+    print(log_entry, flush=True)  # flush=True ensures immediate output
     bot_logs.append(log_entry)
     # Keep only last 100 logs
     if len(bot_logs) > 100:

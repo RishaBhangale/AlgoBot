@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
 # Set environment variables for Chrome
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /app
