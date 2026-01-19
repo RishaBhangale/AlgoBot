@@ -30,15 +30,15 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 │  │  - /status → Bot status JSON    │    │
 │  │  - /docs   → API documentation  │    │
 │  └─────────────┬───────────────────┘    │
-│                │                         │
+│                │                        │
 │  ┌─────────────▼───────────────────┐    │
 │  │  Background Thread              │    │
 │  │  - SupertrendBot                │───►├─── Telegram Alerts
 │  │  - Selenium Auto-Login          │    │
 │  │  - Kite Connect API             │    │
 │  └─────────────────────────────────┘    │
-│                                          │
-│  System: Chromium + ChromeDriver         │
+│                                         │
+│  System: Chromium + ChromeDriver        │
 └─────────────────────────────────────────┘
 ```
 
@@ -46,16 +46,16 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 
 ```
 supertrend-bot/
-├── app.py              # FastAPI server (entry point)
-├── main.py             # Trading bot core
-├── auto_login.py       # Selenium auto-login
+├── app.py               # FastAPI server (entry point)
+├── main.py              # Trading bot core
+├── auto_login.py        # Selenium auto-login
 ├── telegram_notifier.py # Telegram notifications
-├── Dockerfile          # Docker config with Chromium
-├── render.yaml         # Render deployment config
-├── requirements.txt    # Python dependencies
-├── .env.example        # Environment template
-├── .gitignore          # Git ignore rules
-└── logs/               # Daily logs
+├── Dockerfile           # Docker config with Chromium
+├── render.yaml          # Render deployment config
+├── requirements.txt     # Python dependencies
+├── .env.example         # Environment template
+├── .gitignore           # Git ignore rules
+└── logs/                # Daily logs
 ```
 
 ---
@@ -132,6 +132,10 @@ git push -u origin main
 | `TELEGRAM_CHAT_ID` | Your chat ID |
 
 6. Click **Create Web Service**
+
+> **Note**: Since we use Docker, Render automatically uses the Dockerfile.
+> - **Build**: Defined in Dockerfile (`pip install -r requirements.txt`)
+> - **Start**: Defined in Dockerfile (`uvicorn app:app --host 0.0.0.0 --port 10000`)
 
 ### Step 3: Setup UptimeRobot (Prevent Sleep)
 
