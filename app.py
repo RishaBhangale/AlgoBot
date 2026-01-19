@@ -3,16 +3,13 @@
 Supertrend Bot Web Server Wrapper (FastAPI)
 Disguises the trading bot as a web service for Render free tier.
 
-The FastAPI server handles health checks while the actual trading bot
-runs in a background thread with auto-login.
-
-Usage:
-    Local: uvicorn app:app --host 0.0.0.0 --port 5000
-    Render: uvicorn app:app --host 0.0.0.0 --port $PORT
+Key feature: FastAPI responds to health checks IMMEDIATELY,
+while the trading bot authenticates and runs in a background thread.
 """
 import threading
 import os
 import traceback
+import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -25,7 +22,7 @@ from auto_login import KiteAutoLogin, load_credentials, SELENIUM_AVAILABLE
 # Global state
 bot_instance = None
 bot_thread = None
-bot_logs = []  # Store recent logs
+bot_logs = []
 
 bot_status = {
     "status": "initialized",
@@ -41,12 +38,11 @@ bot_status = {
 
 
 def add_log(message: str):
-    """Add log message with timestamp."""
+    """Add log message with timestamp (immediately flushed)."""
     timestamp = now_ist().strftime("%H:%M:%S")
     log_entry = f"[{timestamp}] {message}"
-    print(log_entry, flush=True)  # flush=True ensures immediate output
+    print(log_entry, flush=True)
     bot_logs.append(log_entry)
-    # Keep only last 100 logs
     if len(bot_logs) > 100:
         bot_logs.pop(0)
 
@@ -54,6 +50,9 @@ def add_log(message: str):
 def run_trading_bot():
     """Run the trading bot in background thread with auto-login."""
     global bot_instance, bot_status
+    
+    # Small delay to let FastAPI fully start first
+    time.sleep(2)
     
     add_log("🚀 Trading bot thread started...")
     bot_status["status"] = "starting"
@@ -79,7 +78,36 @@ def run_trading_bot():
         add_log(f"✅ Credentials loaded for user: {creds['user_id']}")
         add_log(f"   TOTP: {'Configured' if creds['totp_secret'] else 'Not configured'}")
         
-        # Step 2: Auto-login with Selenium
+        # Step 2: Check if we should wait for market hours
+        now = now_ist()
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
+        if now.weekday() >= 5:
+            bot_status["market_status"] = "Weekend"
+            add_log("📅 Weekend - Market closed. Bot will wait.")
+        elif now < market_open.replace(hour=8, minute=45):
+            bot_status["market_status"] = "Pre-market (too early)"
+            mins_to_wait = int((market_open.replace(hour=8, minute=45) - now).total_seconds() / 60)
+            add_log(f"⏰ Too early ({now.strftime('%H:%M')}). Login will happen at 8:45 AM.")
+            add_log(f"   Waiting {mins_to_wait} minutes...")
+            bot_status["status"] = "waiting_for_login_time"
+            
+            # Wait until 8:45 AM to login
+            while now_ist() < market_open.replace(hour=8, minute=45):
+                time.sleep(60)
+                if not bot_instance:
+                    return
+            add_log("⏰ 8:45 AM - Starting login process...")
+        elif now > market_close:
+            bot_status["market_status"] = "After hours"
+            add_log("📅 After market hours. Bot will wait for tomorrow.")
+            bot_status["status"] = "waiting_for_tomorrow"
+            return
+        else:
+            bot_status["market_status"] = "Market hours"
+        
+        # Step 3: Auto-login with Selenium
         add_log("🔐 Starting Kite auto-login...")
         bot_status["status"] = "authenticating"
         
@@ -95,7 +123,7 @@ def run_trading_bot():
             user_id=creds["user_id"],
             password=creds["password"],
             totp_secret=creds["totp_secret"],
-            headless=True  # Must be True on server
+            headless=True
         )
         
         access_token = auto_login.login()
@@ -110,30 +138,23 @@ def run_trading_bot():
         bot_status["kite_user"] = creds["user_id"]
         add_log(f"✅ Authenticated successfully!")
         
-        # Step 3: Start trading bot with existing token
+        # Step 4: Wait for market if needed
+        now = now_ist()
+        if now < market_open:
+            mins_to_wait = int((market_open - now).total_seconds() / 60)
+            add_log(f"⏳ Waiting {mins_to_wait} mins for market open at 9:15 AM...")
+            bot_status["status"] = "waiting_for_market"
+            
+            while now_ist() < market_open:
+                time.sleep(30)
+        
+        # Step 5: Start trading bot
         add_log("📊 Starting trading bot...")
         bot_status["status"] = "running"
         
         bot_instance = SupertrendBot()
-        
-        # Set the kite instance from auto_login
         bot_instance.kite = auto_login.kite
-        
-        # Check market status
-        now = now_ist()
-        market_open = now.replace(hour=9, minute=15, second=0)
-        market_close = now.replace(hour=15, minute=30, second=0)
-        
-        if now.weekday() >= 5:
-            bot_status["market_status"] = "Weekend - Market Closed"
-        elif now < market_open:
-            bot_status["market_status"] = "Pre-market"
-        elif now > market_close:
-            bot_status["market_status"] = "After-hours"
-        else:
-            bot_status["market_status"] = "Market Open"
-        
-        add_log(f"📈 Market status: {bot_status['market_status']}")
+        bot_instance.is_running = True
         
         # Notify via Telegram
         if bot_instance.telegram:
@@ -144,7 +165,6 @@ def run_trading_bot():
         add_log("📊 Fetching historical data...")
         bot_instance.fetch_historical()
         
-        # Update candle counts
         for symbol, trader in bot_instance.traders.items():
             bot_status["candles_loaded"][symbol] = len(trader.candles)
             add_log(f"   {symbol}: {len(trader.candles)} candles loaded")
@@ -153,20 +173,24 @@ def run_trading_bot():
         add_log("🔴 Starting live data feed...")
         bot_instance.start_live_feed()
         
-        # Run until stopped
         add_log("✅ Bot is now active and trading!")
         
-        while bot_instance.is_running:
-            # Update current trend status
+        # Run until market close
+        while bot_instance.is_running and bot_instance.is_market_open():
             for symbol, trader in bot_instance.traders.items():
                 if trader.current_trend != 0:
                     trend = "BULLISH" if trader.current_trend == 1 else "BEARISH"
                     bot_status["current_trend"][symbol] = trend
-            
-            import time
             time.sleep(5)
         
-        add_log("⏹️ Bot stopped")
+        add_log("📈 Market closed. Generating report...")
+        bot_instance.generate_report()
+        
+        if bot_instance.ticker:
+            bot_instance.ticker.close()
+        
+        add_log("✅ Trading session complete!")
+        bot_status["status"] = "session_complete"
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -174,8 +198,6 @@ def run_trading_bot():
         bot_status["error"] = error_msg
         add_log(f"❌ Bot error: {error_msg}")
         traceback.print_exc()
-    finally:
-        bot_status["status"] = "stopped"
 
 
 def start_bot_thread():
@@ -192,10 +214,12 @@ def start_bot_thread():
     add_log("✅ Trading bot thread launched")
 
 
+# FastAPI app with lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     add_log("🌐 FastAPI starting up...")
+    # Start bot in background - doesn't block FastAPI
     start_bot_thread()
     yield
     add_log("🛑 FastAPI shutting down...")
@@ -209,12 +233,12 @@ app = FastAPI(
 )
 
 
-# --- HEALTH CHECK ROUTES ---
+# --- HEALTH CHECK ROUTES (respond immediately) ---
 
 @app.get("/", response_class=PlainTextResponse)
 @app.head("/")
 async def health_check():
-    """Main health check endpoint."""
+    """Main health check - responds immediately."""
     bot_status["last_health_check"] = now_ist().isoformat()
     status = bot_status.get("status", "unknown")
     return f"Bot status: {status}"
@@ -223,13 +247,13 @@ async def health_check():
 @app.get("/ping", response_class=PlainTextResponse)
 @app.head("/ping")
 async def ping():
-    """Simple ping endpoint."""
+    """Simple ping - for UptimeRobot."""
     return "pong"
 
 
 @app.get("/favicon.ico")
 async def favicon():
-    """Return empty favicon."""
+    """Empty favicon."""
     return ""
 
 
@@ -245,7 +269,6 @@ async def detailed_status():
         "securities": list(SECURITIES.keys())
     }
     
-    # Get trade info if bot is running
     if bot_instance and hasattr(bot_instance, 'traders'):
         status["positions"] = {}
         status["trades_today"] = {}
@@ -266,7 +289,7 @@ async def detailed_status():
 @app.get("/logs")
 async def get_logs():
     """Get recent bot logs."""
-    return {"logs": bot_logs[-50:]}  # Last 50 logs
+    return {"logs": bot_logs[-50:], "count": len(bot_logs)}
 
 
 @app.get("/logs/all")
