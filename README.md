@@ -11,22 +11,34 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 - **NIFTY**: Target +20%, SL -5%
 - **BANKNIFTY**: Target +10%, SL -5%
 
+## Tech Stack
+
+- **Framework**: FastAPI + Uvicorn
+- **Automation**: Selenium + Chromium (headless)
+- **Containerization**: Docker
+- **Hosting**: Render (free tier)
+
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────┐
-│           Render (Free Tier)            │
+│       Docker Container (Render)         │
 │  ┌─────────────────────────────────┐    │
-│  │  Flask Web Server (gunicorn)    │    │
-│  │  - Health check endpoint        │◄───┼─── UptimeRobot (every 5 min)
-│  │  - /status endpoint             │    │
+│  │  FastAPI Server (uvicorn)       │    │
+│  │  - /       → Health check       │◄───┼─── UptimeRobot (every 5 min)
+│  │  - /ping   → Ping               │    │
+│  │  - /status → Bot status JSON    │    │
+│  │  - /docs   → API documentation  │    │
 │  └─────────────┬───────────────────┘    │
 │                │                         │
 │  ┌─────────────▼───────────────────┐    │
 │  │  Background Thread              │    │
 │  │  - SupertrendBot                │───►├─── Telegram Alerts
-│  │  - Kite Connect                 │    │
+│  │  - Selenium Auto-Login          │    │
+│  │  - Kite Connect API             │    │
 │  └─────────────────────────────────┘    │
+│                                          │
+│  System: Chromium + ChromeDriver         │
 └─────────────────────────────────────────┘
 ```
 
@@ -34,13 +46,15 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 
 ```
 supertrend-bot/
-├── app.py              # Flask wrapper (entry point for Render)
+├── app.py              # FastAPI server (entry point)
 ├── main.py             # Trading bot core
 ├── auto_login.py       # Selenium auto-login
 ├── telegram_notifier.py # Telegram notifications
-├── render.yaml         # Render config
+├── Dockerfile          # Docker config with Chromium
+├── render.yaml         # Render deployment config
 ├── requirements.txt    # Python dependencies
-├── .env                # Credentials (not in git)
+├── .env.example        # Environment template
+├── .gitignore          # Git ignore rules
 └── logs/               # Daily logs
 ```
 
@@ -63,6 +77,8 @@ cp .env.example .env
 
 Edit `.env`:
 ```
+KITE_API_KEY=your_api_key
+KITE_API_SECRET=your_api_secret
 KITE_USER_ID=AB1234
 KITE_PASSWORD=your_password
 KITE_TOTP_SECRET=your_totp_secret
@@ -71,22 +87,17 @@ TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
-### Step 3: Create api_key.txt
-
-```
-your_kite_api_key
-your_kite_api_secret
-```
-
-### Step 4: Test Locally
+### Step 3: Run Locally
 
 ```bash
-# Test Telegram
-python3 telegram_notifier.py
+# With uvicorn directly
+uvicorn app:app --host 0.0.0.0 --port 5000
 
-# Run bot locally
+# Or using Python
 python3 app.py
 ```
+
+Visit `http://localhost:5000/docs` for FastAPI auto-generated documentation.
 
 ---
 
@@ -95,7 +106,6 @@ python3 app.py
 ### Step 1: Push to GitHub
 
 ```bash
-cd supertrend-bot
 git init
 git add .
 git commit -m "Supertrend bot"
@@ -108,49 +118,44 @@ git push -u origin main
 1. Go to [render.com](https://render.com) and sign up
 2. Click **New** → **Web Service**
 3. Connect your GitHub repository
-4. Settings:
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `gunicorn app:app`
+4. Render will auto-detect `Dockerfile`
 5. Add **Environment Variables**:
 
-| Key | Value |
-|-----|-------|
-| `KITE_USER_ID` | Your Zerodha ID |
-| `KITE_PASSWORD` | Your password |
-| `KITE_TOTP_SECRET` | Your TOTP secret |
-| `TELEGRAM_BOT_TOKEN` | Your bot token |
+| Variable | Description |
+|----------|-------------|
+| `KITE_API_KEY` | Kite Connect API key |
+| `KITE_API_SECRET` | Kite Connect API secret |
+| `KITE_USER_ID` | Zerodha user ID |
+| `KITE_PASSWORD` | Zerodha password |
+| `KITE_TOTP_SECRET` | TOTP secret for 2FA |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Your chat ID |
 
 6. Click **Create Web Service**
 
 ### Step 3: Setup UptimeRobot (Prevent Sleep)
 
-Render free tier sleeps after 15 minutes of inactivity. UptimeRobot pings your app to keep it awake.
+Render free tier sleeps after 15 minutes of inactivity.
 
 1. Go to [uptimerobot.com](https://uptimerobot.com) (free)
 2. Sign up and click **Add New Monitor**
 3. Settings:
    - **Monitor Type**: HTTP(s)
-   - **Friendly Name**: Supertrend Bot
    - **URL**: `https://your-app.onrender.com/ping`
    - **Monitoring Interval**: 5 minutes
 4. Click **Create Monitor**
 
-### Step 4: Verify
-
-- Visit `https://your-app.onrender.com/` → Should show "Bot is running!"
-- Visit `https://your-app.onrender.com/status` → Shows bot details
-- Check Telegram for notifications
-
 ---
 
-## Endpoints
+## API Endpoints
 
-| Endpoint | Purpose |
-|----------|---------|
-| `/` | Health check (returns "Bot is running!") |
-| `/ping` | Simple ping for UptimeRobot |
-| `/status` | Detailed bot status JSON |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Health check ("Bot is running!") |
+| `/ping` | GET | Simple ping for UptimeRobot |
+| `/status` | GET | Detailed bot status (JSON) |
+| `/docs` | GET | FastAPI Swagger documentation |
+| `/redoc` | GET | FastAPI ReDoc documentation |
 
 ---
 
@@ -165,14 +170,24 @@ Render free tier sleeps after 15 minutes of inactivity. UptimeRobot pings your a
 
 ---
 
+## Docker
+
+Build and run locally:
+```bash
+docker build -t supertrend-bot .
+docker run -p 10000:10000 --env-file .env supertrend-bot
+```
+
+---
+
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| App sleeping | Check UptimeRobot is configured |
-| No Telegram messages | Run `python3 telegram_notifier.py` locally |
-| Login fails | Verify .env credentials |
-| Check logs | Render Dashboard → Logs |
+| App sleeping | Verify UptimeRobot is pinging `/ping` |
+| No Telegram | Check `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
+| Login fails | Verify Kite credentials in env vars |
+| Chrome error | Ensure Dockerfile installs chromium |
 
 ---
 
