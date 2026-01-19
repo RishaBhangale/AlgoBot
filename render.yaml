@@ -1,15 +1,18 @@
 services:
-  - type: worker
+  - type: web
     name: supertrend-bot
-    runtime: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python run_bot.py"
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: KITE_USER_ID
         sync: false
       - key: KITE_PASSWORD
         sync: false
       - key: KITE_TOTP_SECRET
+        sync: false
+      - key: KITE_API_KEY
+        sync: false
+      - key: KITE_API_SECRET
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false

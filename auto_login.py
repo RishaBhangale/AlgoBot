@@ -111,27 +111,42 @@ class KiteAutoLogin:
         self.access_token = None
     
     def _setup_driver(self):
-        """Setup Chrome WebDriver."""
+        """Setup Chrome WebDriver - works on local and Docker."""
         if not SELENIUM_AVAILABLE:
             raise ImportError("selenium not installed. Run: pip install selenium")
         
         options = Options()
         
+        # CRITICAL: These flags are required for Docker/headless
         if self.headless:
             options.add_argument("--headless=new")
         
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")  # Required for Docker
+        options.add_argument("--disable-dev-shm-usage")  # Overcome limited resources
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         
-        if WEBDRIVER_MANAGER_AVAILABLE:
+        # Check if running in Docker (Chrome/Chromium installed at system level)
+        docker_chrome_path = "/usr/bin/chromium"
+        docker_driver_path = "/usr/bin/chromedriver"
+        
+        if os.path.exists(docker_chrome_path):
+            # Docker environment - use system-installed Chrome
+            log("🐳 Docker environment detected - using system Chromium")
+            options.binary_location = docker_chrome_path
+            service = Service(executable_path=docker_driver_path)
+            self.driver = webdriver.Chrome(service=service, options=options)
+        elif WEBDRIVER_MANAGER_AVAILABLE:
+            # Local environment - use webdriver-manager
+            log("💻 Local environment - using webdriver-manager")
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=options)
         else:
+            # Fallback - hope Chrome is in PATH
+            log("⚠️ Using default Chrome path")
             self.driver = webdriver.Chrome(options=options)
         
         # Stealth settings
@@ -311,23 +326,25 @@ class KiteAutoLogin:
 
 
 def load_credentials():
-    """Load credentials from api_key.txt and .env or environment."""
-    # Load API key and secret from api_key.txt
-    api_file = BASE_DIR / "api_key.txt"
-    if api_file.exists():
-        lines = api_file.read_text().strip().split("\n")
-        api_key = lines[0].strip()
-        api_secret = lines[1].strip()
-    else:
-        api_key = os.environ.get("KITE_API_KEY", "")
-        api_secret = os.environ.get("KITE_API_SECRET", "")
+    """Load credentials from environment, api_key.txt, and .env."""
+    # First check environment variables (for Docker/Render)
+    api_key = os.environ.get("KITE_API_KEY", "")
+    api_secret = os.environ.get("KITE_API_SECRET", "")
     
-    # Load login credentials from .env or environment
+    # If not in env, try api_key.txt
+    if not api_key or not api_secret:
+        api_file = BASE_DIR / "api_key.txt"
+        if api_file.exists():
+            lines = api_file.read_text().strip().split("\n")
+            api_key = lines[0].strip()
+            api_secret = lines[1].strip() if len(lines) > 1 else ""
+    
+    # Load login credentials from environment
     user_id = os.environ.get("KITE_USER_ID", "")
     password = os.environ.get("KITE_PASSWORD", "")
     totp_secret = os.environ.get("KITE_TOTP_SECRET", "")
     
-    # Try loading from .env file
+    # Try loading from .env file (local development)
     env_file = BASE_DIR / ".env"
     if env_file.exists():
         for line in env_file.read_text().split("\n"):
@@ -337,12 +354,16 @@ def load_credentials():
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
                 
-                if key == "KITE_USER_ID":
+                if key == "KITE_USER_ID" and not user_id:
                     user_id = value
-                elif key == "KITE_PASSWORD":
+                elif key == "KITE_PASSWORD" and not password:
                     password = value
-                elif key == "KITE_TOTP_SECRET":
+                elif key == "KITE_TOTP_SECRET" and not totp_secret:
                     totp_secret = value
+                elif key == "KITE_API_KEY" and not api_key:
+                    api_key = value
+                elif key == "KITE_API_SECRET" and not api_secret:
+                    api_secret = value
     
     return {
         "api_key": api_key,
