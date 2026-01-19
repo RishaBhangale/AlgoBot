@@ -398,9 +398,18 @@ class SupertrendBot:
             f.write(line + "\n")
     
     def _load_credentials(self) -> tuple:
-        api_file = BASE_DIR / "api_key.txt"
-        lines = api_file.read_text().strip().split("\n")
-        return lines[0].strip(), lines[1].strip()
+        """Load API credentials from env vars or file."""
+        api_key = os.environ.get("KITE_API_KEY", "")
+        api_secret = os.environ.get("KITE_API_SECRET", "")
+        
+        if not api_key or not api_secret:
+            api_file = BASE_DIR / "api_key.txt"
+            if api_file.exists():
+                lines = api_file.read_text().strip().split("\n")
+                api_key = lines[0].strip()
+                api_secret = lines[1].strip() if len(lines) > 1 else ""
+        
+        return api_key, api_secret
     
     def authenticate(self) -> bool:
         if not KITE_AVAILABLE:
@@ -574,8 +583,10 @@ class SupertrendBot:
         print(f"BANKNIFTY: +{SECURITIES['BANKNIFTY']['target_pct']}%/-{SECURITIES['BANKNIFTY']['sl_pct']}%")
         print("=" * 60 + "\n")
         
-        if not self.authenticate():
-            return
+        # Skip authenticate() if kite is already set (from app.py auto-login)
+        if self.kite is None:
+            if not self.authenticate():
+                return
         
         if not self.is_market_open():
             self.wait_for_market()

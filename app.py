@@ -4,7 +4,7 @@ Supertrend Bot Web Server Wrapper (FastAPI)
 Disguises the trading bot as a web service for Render free tier.
 
 The FastAPI server handles health checks while the actual trading bot
-runs in a background thread.
+runs in a background thread with auto-login.
 
 Usage:
     Local: uvicorn app:app --host 0.0.0.0 --port 5000
@@ -12,40 +12,168 @@ Usage:
 """
 import threading
 import os
+import traceback
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 
-# Import the trading bot
-from main import SupertrendBot, SECURITIES, now_ist
+# Import the trading bot and auto-login
+from main import SupertrendBot, SECURITIES, now_ist, KITE_AVAILABLE
+from auto_login import KiteAutoLogin, load_credentials, SELENIUM_AVAILABLE
 
 # Global state
 bot_instance = None
 bot_thread = None
+bot_logs = []  # Store recent logs
+
 bot_status = {
     "status": "initialized",
     "started_at": None,
     "last_health_check": None,
-    "trades_today": 0,
-    "total_pnl": 0
+    "authenticated": False,
+    "kite_user": None,
+    "error": None,
+    "market_status": None,
+    "candles_loaded": {},
+    "current_trend": {}
 }
 
 
+def add_log(message: str):
+    """Add log message with timestamp."""
+    timestamp = now_ist().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry)
+    bot_logs.append(log_entry)
+    # Keep only last 100 logs
+    if len(bot_logs) > 100:
+        bot_logs.pop(0)
+
+
 def run_trading_bot():
-    """Run the trading bot in background thread."""
+    """Run the trading bot in background thread with auto-login."""
     global bot_instance, bot_status
     
-    print("🚀 Trading bot thread started...")
-    bot_status["status"] = "running"
+    add_log("🚀 Trading bot thread started...")
+    bot_status["status"] = "starting"
     bot_status["started_at"] = now_ist().isoformat()
     
     try:
+        # Step 1: Load credentials
+        add_log("📋 Loading credentials...")
+        creds = load_credentials()
+        
+        if not creds["api_key"] or not creds["api_secret"]:
+            bot_status["status"] = "error"
+            bot_status["error"] = "Missing KITE_API_KEY or KITE_API_SECRET"
+            add_log("❌ Missing API credentials!")
+            return
+        
+        if not creds["user_id"] or not creds["password"]:
+            bot_status["status"] = "error"
+            bot_status["error"] = "Missing KITE_USER_ID or KITE_PASSWORD"
+            add_log("❌ Missing login credentials!")
+            return
+        
+        add_log(f"✅ Credentials loaded for user: {creds['user_id']}")
+        add_log(f"   TOTP: {'Configured' if creds['totp_secret'] else 'Not configured'}")
+        
+        # Step 2: Auto-login with Selenium
+        add_log("🔐 Starting Kite auto-login...")
+        bot_status["status"] = "authenticating"
+        
+        if not SELENIUM_AVAILABLE:
+            bot_status["status"] = "error"
+            bot_status["error"] = "Selenium not available"
+            add_log("❌ Selenium not installed!")
+            return
+        
+        auto_login = KiteAutoLogin(
+            api_key=creds["api_key"],
+            api_secret=creds["api_secret"],
+            user_id=creds["user_id"],
+            password=creds["password"],
+            totp_secret=creds["totp_secret"],
+            headless=True  # Must be True on server
+        )
+        
+        access_token = auto_login.login()
+        
+        if not access_token:
+            bot_status["status"] = "error"
+            bot_status["error"] = "Auto-login failed - check credentials"
+            add_log("❌ Auto-login failed!")
+            return
+        
+        bot_status["authenticated"] = True
+        bot_status["kite_user"] = creds["user_id"]
+        add_log(f"✅ Authenticated successfully!")
+        
+        # Step 3: Start trading bot with existing token
+        add_log("📊 Starting trading bot...")
+        bot_status["status"] = "running"
+        
         bot_instance = SupertrendBot()
-        bot_instance.run()
+        
+        # Set the kite instance from auto_login
+        bot_instance.kite = auto_login.kite
+        
+        # Check market status
+        now = now_ist()
+        market_open = now.replace(hour=9, minute=15, second=0)
+        market_close = now.replace(hour=15, minute=30, second=0)
+        
+        if now.weekday() >= 5:
+            bot_status["market_status"] = "Weekend - Market Closed"
+        elif now < market_open:
+            bot_status["market_status"] = "Pre-market"
+        elif now > market_close:
+            bot_status["market_status"] = "After-hours"
+        else:
+            bot_status["market_status"] = "Market Open"
+        
+        add_log(f"📈 Market status: {bot_status['market_status']}")
+        
+        # Notify via Telegram
+        if bot_instance.telegram:
+            bot_instance.telegram.notify_bot_start(list(SECURITIES.keys()))
+            add_log("📱 Telegram notification sent!")
+        
+        # Fetch historical data
+        add_log("📊 Fetching historical data...")
+        bot_instance.fetch_historical()
+        
+        # Update candle counts
+        for symbol, trader in bot_instance.traders.items():
+            bot_status["candles_loaded"][symbol] = len(trader.candles)
+            add_log(f"   {symbol}: {len(trader.candles)} candles loaded")
+        
+        # Start live feed
+        add_log("🔴 Starting live data feed...")
+        bot_instance.start_live_feed()
+        
+        # Run until stopped
+        add_log("✅ Bot is now active and trading!")
+        
+        while bot_instance.is_running:
+            # Update current trend status
+            for symbol, trader in bot_instance.traders.items():
+                if trader.current_trend != 0:
+                    trend = "BULLISH" if trader.current_trend == 1 else "BEARISH"
+                    bot_status["current_trend"][symbol] = trend
+            
+            import time
+            time.sleep(5)
+        
+        add_log("⏹️ Bot stopped")
+        
     except Exception as e:
-        print(f"❌ Bot error: {e}")
-        bot_status["status"] = f"error: {str(e)}"
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        bot_status["status"] = "error"
+        bot_status["error"] = error_msg
+        add_log(f"❌ Bot error: {error_msg}")
+        traceback.print_exc()
     finally:
         bot_status["status"] = "stopped"
 
@@ -55,23 +183,22 @@ def start_bot_thread():
     global bot_thread
     
     if bot_thread is not None and bot_thread.is_alive():
-        print("⚠️ Bot thread already running")
+        add_log("⚠️ Bot thread already running")
         return
     
     bot_thread = threading.Thread(target=run_trading_bot, name="TradingBot")
     bot_thread.daemon = True
     bot_thread.start()
-    print("✅ Trading bot thread started")
+    add_log("✅ Trading bot thread launched")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    # Startup
+    add_log("🌐 FastAPI starting up...")
     start_bot_thread()
     yield
-    # Shutdown
-    print("🛑 Shutting down...")
+    add_log("🛑 FastAPI shutting down...")
 
 
 app = FastAPI(
@@ -87,9 +214,10 @@ app = FastAPI(
 @app.get("/", response_class=PlainTextResponse)
 @app.head("/")
 async def health_check():
-    """Main health check endpoint for UptimeRobot."""
+    """Main health check endpoint."""
     bot_status["last_health_check"] = now_ist().isoformat()
-    return "Bot is running!"
+    status = bot_status.get("status", "unknown")
+    return f"Bot status: {status}"
 
 
 @app.get("/ping", response_class=PlainTextResponse)
@@ -101,7 +229,7 @@ async def ping():
 
 @app.get("/favicon.ico")
 async def favicon():
-    """Return empty favicon to avoid 404s."""
+    """Return empty favicon."""
     return ""
 
 
@@ -111,10 +239,9 @@ async def detailed_status():
     global bot_instance, bot_status
     
     status = {
-        "status": bot_status["status"],
-        "started_at": bot_status["started_at"],
-        "last_health_check": bot_status["last_health_check"],
+        "bot": bot_status.copy(),
         "current_time": now_ist().isoformat(),
+        "market_open": bot_instance.is_market_open() if bot_instance else False,
         "securities": list(SECURITIES.keys())
     }
     
@@ -127,15 +254,29 @@ async def detailed_status():
             status["positions"][symbol] = {
                 "has_position": trader.position is not None,
                 "option_type": trader.position.option_type if trader.position else None,
-                "entry_price": trader.position.entry_price if trader.position else None
+                "entry_price": trader.position.entry_price if trader.position else None,
+                "candles": len(trader.candles),
+                "trend": "BULLISH" if trader.current_trend == 1 else "BEARISH" if trader.current_trend == -1 else "NONE"
             }
             status["trades_today"][symbol] = len(trader.trades)
     
     return status
 
 
+@app.get("/logs")
+async def get_logs():
+    """Get recent bot logs."""
+    return {"logs": bot_logs[-50:]}  # Last 50 logs
+
+
+@app.get("/logs/all")
+async def get_all_logs():
+    """Get all bot logs."""
+    return {"logs": bot_logs, "count": len(bot_logs)}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5000))
-    print(f"🌐 Starting FastAPI server on port {port}")
+    add_log(f"🌐 Starting FastAPI server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
