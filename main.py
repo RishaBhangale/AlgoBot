@@ -63,6 +63,10 @@ ATR_PERIOD = 10
 ATR_MULTIPLIER = 3.0
 
 # Securities configuration
+# Target: 20%, SL: 10% for all
+TARGET_PCT = 20
+SL_PCT = 10
+
 SECURITIES = {
     "NIFTY": {
         "name": "NIFTY 50",
@@ -70,8 +74,8 @@ SECURITIES = {
         "lot_size": 50,
         "strike_interval": 50,
         "option_prefix": "NIFTY",
-        "target_pct": 20,
-        "sl_pct": 5,
+        "target_pct": TARGET_PCT,
+        "sl_pct": SL_PCT,
     },
     "BANKNIFTY": {
         "name": "BANK NIFTY",
@@ -79,8 +83,8 @@ SECURITIES = {
         "lot_size": 25,
         "strike_interval": 100,
         "option_prefix": "BANKNIFTY",
-        "target_pct": 10,
-        "sl_pct": 5,
+        "target_pct": TARGET_PCT,
+        "sl_pct": SL_PCT,
     },
 }
 
@@ -187,7 +191,15 @@ class Position:
 
 
 class SupertrendTrader:
-    """Handles Supertrend trading for one security."""
+    """
+    Handles Supertrend trading for one security.
+    
+    Rules:
+    - Enter position immediately based on current trend (BULLISH → CE, BEARISH → PE)
+    - Target: 20%, SL: 10%
+    - Hold till expiry (not daily)
+    - Close only on: signal change, target hit, or SL hit
+    """
     
     def __init__(self, symbol: str, config: Dict, logger, telegram: 'TelegramNotifier' = None):
         self.symbol = symbol
@@ -199,8 +211,9 @@ class SupertrendTrader:
         self.current_candle: Optional[Dict] = None
         self.last_candle_time: Optional[datetime] = None
         
-        self.current_trend: int = 0
+        self.current_trend: int = 0  # 1 = BULLISH, -1 = BEARISH
         self.supertrend_value: float = 0
+        self.initial_position_taken: bool = False  # Track if we've entered initial position
         
         self.position: Optional[Position] = None
         self.trades: List[Position] = []
@@ -234,11 +247,12 @@ class SupertrendTrader:
             
             self.last_candle_time = candle_start
             
+            # Check for SL/Target on every tick (real-time monitoring)
             if self.position:
                 self._check_exit(ltp)
     
     def _on_candle_close(self, candle: Dict):
-        """Handle candle close."""
+        """Handle candle close - check trend and take action."""
         self.candles.append(candle)
         if len(self.candles) > 100:
             self.candles = self.candles[-100:]
@@ -250,61 +264,54 @@ class SupertrendTrader:
         df = calculate_supertrend(df, ATR_PERIOD, ATR_MULTIPLIER)
         
         latest = df.iloc[-1]
+        prev_trend = self.current_trend
         self.current_trend = int(latest['trend'])
         self.supertrend_value = latest['supertrend']
-        signal = latest['signal']
         
         trend_str = "🟢 BULLISH" if self.current_trend == 1 else "🔴 BEARISH"
         self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.2f} | ST:{self.supertrend_value:.2f} | {trend_str}")
         
-        if signal:
-            self._execute_signal(signal, candle)
+        # IMMEDIATE ENTRY: If no position yet, enter based on current trend
+        if not self.initial_position_taken and self.current_trend != 0:
+            signal = "BUY" if self.current_trend == 1 else "SELL"
+            self.logger(f"[{self.symbol}] 🎯 Initial entry based on current trend: {signal}")
+            self._enter_position(signal, candle)
+            self.initial_position_taken = True
+            return
+        
+        # SIGNAL CHANGE: Close existing position and enter new one
+        if prev_trend != 0 and self.current_trend != prev_trend:
+            new_signal = "BUY" if self.current_trend == 1 else "SELL"
+            self.logger(f"[{self.symbol}] 🔄 Trend changed! New signal: {new_signal}")
+            
+            # Close existing position if any
+            if self.position:
+                self._close_position(candle["close"], "SIGNAL_CHANGE")
+            
+            # Enter new position
+            self._enter_position(new_signal, candle)
     
-    def _execute_signal(self, signal: str, candle: Dict):
-        """Execute Supertrend signal."""
+    def _enter_position(self, signal: str, candle: Dict):
+        """Enter a new position based on signal."""
         spot = candle["close"]
-        new_type = "CE" if signal == "BUY" else "PE"
+        option_type = "CE" if signal == "BUY" else "PE"
         
-        # Position reversal
-        if self.position:
-            if (self.position.option_type == "CE" and signal == "SELL") or \
-               (self.position.option_type == "PE" and signal == "BUY"):
-                
-                move = spot - self.position.spot_at_entry
-                delta = 0.5 if self.position.option_type == "CE" else -0.5
-                exit_price = self.position.entry_price + (move * delta)
-                
-                self.position.close(exit_price, "REVERSAL")
-                self.trades.append(self.position)
-                
-                emoji = "✅" if self.position.pnl > 0 else "🛑"
-                self.logger(f"[{self.symbol}] {emoji} REVERSAL | P&L: ₹{self.position.pnl:.2f}")
-                print(f"\n🔄 [{self.symbol}] REVERSAL | P&L: ₹{self.position.pnl:.2f}")
-                
-                # Telegram notification for exit
-                if self.telegram:
-                    self.telegram.notify_trade_exit(
-                        self.symbol, self.position.option_type, self.position.strike,
-                        self.position.entry_price, exit_price, self.position.pnl, "REVERSAL"
-                    )
-                
-                self.position = None
-            else:
-                return
-        
-        # New position
+        # Calculate strike (ATM)
         strike = round(spot / self.config["strike_interval"]) * self.config["strike_interval"]
-        itm = max(0, spot - strike) if new_type == "CE" else max(0, strike - spot)
-        entry = itm + spot * 0.003 + 20
         
-        target = entry * (1 + self.config["target_pct"] / 100)
-        sl = entry * (1 - self.config["sl_pct"] / 100)
+        # Estimate option premium (ITM value + time value)
+        itm = max(0, spot - strike) if option_type == "CE" else max(0, strike - spot)
+        entry_price = itm + spot * 0.003 + 20  # Approximate premium
+        
+        # Target 20%, SL 10%
+        target = entry_price * (1 + self.config["target_pct"] / 100)
+        sl = entry_price * (1 - self.config["sl_pct"] / 100)
         
         self.position = Position(
             security=self.symbol,
-            option_type=new_type,
+            option_type=option_type,
             strike=strike,
-            entry_price=entry,
+            entry_price=entry_price,
             target=target,
             sl=sl,
             quantity=self.config["lot_size"],
@@ -320,56 +327,73 @@ class SupertrendTrader:
         })
         
         emoji = "🟢" if signal == "BUY" else "🔴"
-        self.logger(f"[{self.symbol}] {emoji} {signal} | {new_type} {strike} @ ₹{entry:.2f}")
+        self.logger(f"[{self.symbol}] {emoji} {signal} | {option_type} {strike} @ ₹{entry_price:.2f}")
         
-        print(f"\n{'='*50}")
-        print(f"{emoji} [{self.symbol}] SUPERTREND {signal} - {new_type}")
-        print(f"   Strike: {strike} | Entry: ₹{entry:.2f}")
-        print(f"   Target: ₹{target:.2f} | SL: ₹{sl:.2f}")
-        print(f"{'='*50}\n")
+        print(f"\n{'='*50}", flush=True)
+        print(f"{emoji} [{self.symbol}] NEW POSITION - {option_type}", flush=True)
+        print(f"   Signal: {signal} (Trend: {'BULLISH' if signal == 'BUY' else 'BEARISH'})", flush=True)
+        print(f"   Strike: {strike} | Entry: ₹{entry_price:.2f}", flush=True)
+        print(f"   Target: ₹{target:.2f} (+{self.config['target_pct']}%)", flush=True)
+        print(f"   SL: ₹{sl:.2f} (-{self.config['sl_pct']}%)", flush=True)
+        print(f"   Qty: {self.config['lot_size']} | Hold: Till Expiry", flush=True)
+        print(f"{'='*50}\n", flush=True)
         
-        # Telegram notification for entry
+        # Telegram notification
         if self.telegram:
             self.telegram.notify_trade_entry(
-                self.symbol, new_type, strike, entry, target, sl,
+                self.symbol, option_type, strike, entry_price, target, sl,
                 self.config["lot_size"], signal
             )
     
-    def _check_exit(self, current_ltp: float):
-        """Check for SL/Target."""
+    def _close_position(self, current_spot: float, reason: str):
+        """Close the current position."""
         if not self.position:
             return
         
+        # Calculate exit price based on spot movement
+        move = current_spot - self.position.spot_at_entry
+        delta = 0.5 if self.position.option_type == "CE" else -0.5
+        exit_price = max(0.05, self.position.entry_price + (move * delta))
+        
+        self.position.close(exit_price, reason)
+        self.trades.append(self.position)
+        
+        emoji = "✅" if self.position.pnl > 0 else "🛑"
+        self.logger(f"[{self.symbol}] {emoji} {reason} | P&L: ₹{self.position.pnl:.2f}")
+        
+        print(f"\n{emoji} [{self.symbol}] POSITION CLOSED", flush=True)
+        print(f"   Reason: {reason}", flush=True)
+        print(f"   Entry: ₹{self.position.entry_price:.2f} → Exit: ₹{exit_price:.2f}", flush=True)
+        print(f"   P&L: ₹{self.position.pnl:,.2f}\n", flush=True)
+        
+        # Telegram notification
+        if self.telegram:
+            self.telegram.notify_trade_exit(
+                self.symbol, self.position.option_type, self.position.strike,
+                self.position.entry_price, exit_price, self.position.pnl, reason
+            )
+        
+        self.position = None
+    
+    def _check_exit(self, current_ltp: float):
+        """Check for SL/Target exit on every tick."""
+        if not self.position:
+            return
+        
+        # Estimate current option price based on spot movement
         move = current_ltp - self.position.spot_at_entry
         delta = 0.5 if self.position.option_type == "CE" else -0.5
-        opt_price = self.position.entry_price + (move * delta)
+        estimated_opt_price = self.position.entry_price + (move * delta)
         
-        exit_price = None
-        reason = None
+        # Check target (20% profit)
+        if estimated_opt_price >= self.position.target:
+            self._close_position(current_ltp, "TARGET_HIT")
+            return
         
-        if opt_price >= self.position.target:
-            exit_price = self.position.target
-            reason = "TARGET"
-        elif opt_price <= self.position.sl:
-            exit_price = self.position.sl
-            reason = "SL"
-        
-        if exit_price:
-            self.position.close(exit_price, reason)
-            self.trades.append(self.position)
-            
-            emoji = "✅" if self.position.pnl > 0 else "🛑"
-            self.logger(f"[{self.symbol}] {emoji} {reason} | P&L: ₹{self.position.pnl:.2f}")
-            print(f"\n{emoji} [{self.symbol}] {reason} | P&L: ₹{self.position.pnl:.2f}\n")
-            
-            # Telegram notification for exit
-            if self.telegram:
-                self.telegram.notify_trade_exit(
-                    self.symbol, self.position.option_type, self.position.strike,
-                    self.position.entry_price, exit_price, self.position.pnl, reason
-                )
-            
-            self.position = None
+        # Check SL (10% loss)
+        if estimated_opt_price <= self.position.sl:
+            self._close_position(current_ltp, "SL_HIT")
+            return
 
 
 class SupertrendBot:
@@ -614,14 +638,15 @@ class SupertrendBot:
             self.ticker.close()
     
     def stop(self):
+        """Stop the bot - does NOT close positions (hold till expiry)."""
         self.is_running = False
         self.stop_event.set()
         
-        for trader in self.traders.values():
+        # Log open positions but DON'T close them (hold till expiry)
+        for symbol, trader in self.traders.items():
             if trader.position:
-                trader.position.close(trader.position.entry_price, "MANUAL_STOP")
-                trader.trades.append(trader.position)
-                trader.position = None
+                self._log(f"[{symbol}] Open position held: {trader.position.option_type} {trader.position.strike}")
+                print(f"📌 [{symbol}] Holding position: {trader.position.option_type} {trader.position.strike}", flush=True)
 
 
 def main():
