@@ -78,34 +78,45 @@ def run_trading_bot():
         add_log(f"✅ Credentials loaded for user: {creds['user_id']}")
         add_log(f"   TOTP: {'Configured' if creds['totp_secret'] else 'Not configured'}")
         
-        # Step 2: Check if we should wait for market hours
+        # Step 2: Check market timing
         now = now_ist()
+        login_time = now.replace(hour=8, minute=45, second=0, microsecond=0)
         market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
         
+        # Weekend check
         if now.weekday() >= 5:
-            bot_status["market_status"] = "Weekend"
-            add_log("📅 Weekend - Market closed. Bot will wait.")
-        elif now < market_open.replace(hour=8, minute=45):
-            bot_status["market_status"] = "Pre-market (too early)"
-            mins_to_wait = int((market_open.replace(hour=8, minute=45) - now).total_seconds() / 60)
-            add_log(f"⏰ Too early ({now.strftime('%H:%M')}). Login will happen at 8:45 AM.")
-            add_log(f"   Waiting {mins_to_wait} minutes...")
+            bot_status["market_status"] = "Weekend - Market Closed"
+            add_log("📅 Weekend - Market closed. Will wait for Monday.")
+            bot_status["status"] = "waiting_for_weekday"
+            # Wait until Monday 8:45 AM (simplified - just wait and check periodically)
+            while now_ist().weekday() >= 5:
+                time.sleep(300)  # Check every 5 minutes
+            now = now_ist()  # Update time after weekend
+        
+        # After market hours check
+        if now > market_close:
+            bot_status["market_status"] = "After Hours"
+            add_log("📅 Market is closed (after 3:30 PM). Will try tomorrow.")
+            bot_status["status"] = "waiting_for_tomorrow"
+            return  # Exit, will restart tomorrow when UptimeRobot wakes it
+        
+        # Too early - wait until 8:45 AM
+        if now < login_time:
+            mins_to_wait = int((login_time - now).total_seconds() / 60)
+            add_log(f"⏰ Too early ({now.strftime('%H:%M')}). Waiting until 8:45 AM ({mins_to_wait} mins)...")
             bot_status["status"] = "waiting_for_login_time"
             
-            # Wait until 8:45 AM to login
-            while now_ist() < market_open.replace(hour=8, minute=45):
-                time.sleep(60)
-                if not bot_instance:
-                    return
-            add_log("⏰ 8:45 AM - Starting login process...")
-        elif now > market_close:
-            bot_status["market_status"] = "After hours"
-            add_log("📅 After market hours. Bot will wait for tomorrow.")
-            bot_status["status"] = "waiting_for_tomorrow"
-            return
-        else:
-            bot_status["market_status"] = "Market hours"
+            while now_ist() < login_time:
+                time.sleep(60)  # Check every minute
+                # Log progress every 30 minutes
+                remaining = int((login_time - now_ist()).total_seconds() / 60)
+                if remaining % 30 == 0 and remaining > 0:
+                    add_log(f"⏳ Still waiting... {remaining} mins until login")
+            
+            add_log("⏰ 8:45 AM reached - proceeding with login!")
+        
+        bot_status["market_status"] = "Ready to trade"
         
         # Step 3: Auto-login with Selenium
         add_log("🔐 Starting Kite auto-login...")
