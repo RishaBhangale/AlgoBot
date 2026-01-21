@@ -471,11 +471,19 @@ class SupertrendBot:
             return False
     
     def fetch_historical(self):
+        """Fetch historical candle data for all securities."""
+        if not self.kite:
+            print("❌ fetch_historical: Kite not initialized!", flush=True)
+            self._log("❌ fetch_historical: Kite not initialized!")
+            return
+        
         for symbol, trader in self.traders.items():
             try:
                 config = SECURITIES[symbol]
                 to_date = now_ist()
                 from_date = to_date - timedelta(hours=4)
+                
+                print(f"📊 Fetching {symbol} from {from_date} to {to_date}...", flush=True)
                 
                 data = self.kite.historical_data(
                     instrument_token=config["instrument_token"],
@@ -483,6 +491,8 @@ class SupertrendBot:
                     to_date=to_date,
                     interval="5minute"
                 )
+                
+                print(f"   Got {len(data)} candles from API", flush=True)
                 
                 for candle in data[-50:]:
                     trader.candles.append({
@@ -494,19 +504,33 @@ class SupertrendBot:
                     })
                 
                 self._log(f"Loaded {len(trader.candles)} candles for {symbol}")
+                print(f"✅ {symbol}: {len(trader.candles)} candles loaded", flush=True)
                 
             except Exception as e:
-                self._log(f"Error fetching {symbol}: {e}")
+                error_msg = f"Error fetching {symbol}: {type(e).__name__}: {e}"
+                self._log(error_msg)
+                print(f"❌ {error_msg}", flush=True)
     
     def start_live_feed(self):
+        """Start WebSocket for live price feed."""
         api_key, _ = self._load_credentials()
+        
+        if not self.kite or not self.kite.access_token:
+            print("❌ start_live_feed: No access token!", flush=True)
+            self._log("❌ start_live_feed: No access token!")
+            return
+        
+        print(f"🔌 Starting WebSocket with token: {self.kite.access_token[:10]}...", flush=True)
+        
         self.ticker = KiteTicker(api_key=api_key, access_token=self.kite.access_token)
         
         tokens = [config["instrument_token"] for config in SECURITIES.values()]
         token_to_symbol = {config["instrument_token"]: symbol for symbol, config in SECURITIES.items()}
         
         def on_connect(ws, response):
-            self._log(f"Connected: {list(SECURITIES.keys())}")
+            msg = f"WebSocket connected: {list(SECURITIES.keys())}"
+            self._log(msg)
+            print(f"✅ {msg}", flush=True)
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
         
@@ -520,11 +544,19 @@ class SupertrendBot:
                     self.traders[token_to_symbol[token]].process_tick(ltp, tick_time)
         
         def on_close(ws, code, reason):
-            self._log(f"Disconnected: {code}")
+            msg = f"WebSocket closed: {code} - {reason}"
+            self._log(msg)
+            print(f"⚠️ {msg}", flush=True)
+        
+        def on_error(ws, code, reason):
+            msg = f"WebSocket error: {code} - {reason}"
+            self._log(msg)
+            print(f"❌ {msg}", flush=True)
         
         self.ticker.on_connect = on_connect
         self.ticker.on_ticks = on_ticks
         self.ticker.on_close = on_close
+        self.ticker.on_error = on_error
         
         self.ticker.connect(threaded=True)
     
