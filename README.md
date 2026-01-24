@@ -2,14 +2,34 @@
 
 Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifications.
 
-## Features
+## Strategy
 
-- **Supertrend Indicator**: ATR Period 10, Multiplier 3.0
-- **Timeframe**: 5 minutes
-- **Auto-Login**: Selenium-based daily authentication
-- **Telegram Notifications**: Real-time trade alerts & daily summaries
-- **NIFTY**: Target +20%, SL -5%
-- **BANKNIFTY**: Target +10%, SL -5%
+| Parameter | Value |
+|-----------|-------|
+| **Indicator** | Supertrend (ATR Period: 10, Multiplier: 3.0) |
+| **Timeframe** | 5 minutes |
+| **Target** | +20% profit |
+| **Stop Loss** | -10% loss |
+| **Entry** | Immediate on current trend |
+| **Exit** | Target hit, SL hit, or Signal change |
+| **Hold** | Till expiry (not daily) |
+| **Capital** | ₹1,00,000 (simulated) |
+
+## Trading Rules
+
+1. **Bot starts** → Checks current Supertrend trend
+2. **BULLISH trend** → Buys 1 lot CE (ATM strike)
+3. **BEARISH trend** → Buys 1 lot PE (ATM strike)
+4. **Monitors** every tick for Target (20%) / SL (10%)
+5. **Signal changes** → Closes old position, opens new one
+6. **Market closes** → Position held till next day/expiry
+
+## Securities
+
+| Index | Lot Size | Strike Interval |
+|-------|----------|-----------------|
+| NIFTY | 50 | 50 |
+| BANKNIFTY | 25 | 100 |
 
 ## Tech Stack
 
@@ -28,14 +48,14 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 │  │  - /       → Health check       │◄───┼─── UptimeRobot (every 5 min)
 │  │  - /ping   → Ping               │    │
 │  │  - /status → Bot status JSON    │    │
-│  │  - /docs   → API documentation  │    │
+│  │  - /logs   → Recent bot logs    │    │
 │  └─────────────┬───────────────────┘    │
 │                │                        │
 │  ┌─────────────▼───────────────────┐    │
 │  │  Background Thread              │    │
-│  │  - SupertrendBot                │───►├─── Telegram Alerts
-│  │  - Selenium Auto-Login          │    │
-│  │  - Kite Connect API             │    │
+│  │  - 8:45 AM: Selenium login      │    │
+│  │  - 9:15 AM: Start trading       │───►├─── Telegram Alerts
+│  │  - 3:30 PM: Generate report     │    │
 │  └─────────────────────────────────┘    │
 │                                         │
 │  System: Chromium + ChromeDriver        │
@@ -55,7 +75,7 @@ supertrend-bot/
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Environment template
 ├── .gitignore           # Git ignore rules
-└── logs/                # Daily logs
+└── logs/                # Daily logs & reports
 ```
 
 ---
@@ -70,7 +90,6 @@ pip install -r requirements.txt
 
 ### Step 2: Configure Credentials
 
-Create `.env` from template:
 ```bash
 cp .env.example .env
 ```
@@ -90,35 +109,29 @@ TELEGRAM_CHAT_ID=your_chat_id
 ### Step 3: Run Locally
 
 ```bash
-# With uvicorn directly
-uvicorn app:app --host 0.0.0.0 --port 5000
-
-# Or using Python
 python3 app.py
+# or
+uvicorn app:app --host 0.0.0.0 --port 5000
 ```
-
-Visit `http://localhost:5000/docs` for FastAPI auto-generated documentation.
 
 ---
 
-## Cloud Deployment (Render - Free Tier)
+## Cloud Deployment (Render)
 
 ### Step 1: Push to GitHub
 
 ```bash
-git init
 git add .
-git commit -m "Supertrend bot"
-git remote add origin https://github.com/yourusername/supertrend-bot.git
-git push -u origin main
+git commit -m "Deploy trading bot"
+git push origin main
 ```
 
 ### Step 2: Deploy on Render
 
-1. Go to [render.com](https://render.com) and sign up
+1. Go to [render.com](https://render.com)
 2. Click **New** → **Web Service**
 3. Connect your GitHub repository
-4. Render will auto-detect `Dockerfile`
+4. Render auto-detects `Dockerfile`
 5. Add **Environment Variables**:
 
 | Variable | Description |
@@ -133,33 +146,28 @@ git push -u origin main
 
 6. Click **Create Web Service**
 
-> **Note**: Since we use Docker, Render automatically uses the Dockerfile.
-> - **Build**: Defined in Dockerfile (`pip install -r requirements.txt`)
-> - **Start**: Defined in Dockerfile (`uvicorn app:app --host 0.0.0.0 --port 10000`)
+### Step 3: Setup UptimeRobot
 
-### Step 3: Setup UptimeRobot (Prevent Sleep)
+Render free tier sleeps after 15 mins inactivity.
 
-Render free tier sleeps after 15 minutes of inactivity.
-
-1. Go to [uptimerobot.com](https://uptimerobot.com) (free)
-2. Sign up and click **Add New Monitor**
-3. Settings:
-   - **Monitor Type**: HTTP(s)
-   - **URL**: `https://your-app.onrender.com/ping`
-   - **Monitoring Interval**: 5 minutes
-4. Click **Create Monitor**
+1. Go to [uptimerobot.com](https://uptimerobot.com)
+2. Add New Monitor:
+   - Type: HTTP(s)
+   - URL: `https://your-app.onrender.com/ping`
+   - Interval: 5 minutes
 
 ---
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Health check ("Bot is running!") |
-| `/ping` | GET | Simple ping for UptimeRobot |
-| `/status` | GET | Detailed bot status (JSON) |
-| `/docs` | GET | FastAPI Swagger documentation |
-| `/redoc` | GET | FastAPI ReDoc documentation |
+| Endpoint | Description |
+|----------|-------------|
+| `/` | Health check status |
+| `/ping` | Simple ping for UptimeRobot |
+| `/status` | Detailed bot status (JSON) |
+| `/logs` | Recent 50 log entries |
+| `/logs/all` | All log entries |
+| `/docs` | FastAPI Swagger docs |
 
 ---
 
@@ -167,20 +175,21 @@ Render free tier sleeps after 15 minutes of inactivity.
 
 | Event | Message |
 |-------|---------|
-| Bot Start | Securities, strategy |
-| Trade Entry | Option type, strike, entry, target, SL |
-| Trade Exit | Exit price, P&L, reason |
-| Daily Summary | All trades, total P&L |
+| Bot Start | Securities, strategy details |
+| Trade Entry | CE/PE, Strike, Entry, Target, SL, Qty |
+| Trade Exit | Exit price, P&L, Reason (TARGET/SL/SIGNAL_CHANGE) |
+| Daily Summary | All trades, wins, losses, total P&L |
 
 ---
 
-## Docker
+## Daily Schedule
 
-Build and run locally:
-```bash
-docker build -t supertrend-bot .
-docker run -p 10000:10000 --env-file .env supertrend-bot
-```
+| Time | Action |
+|------|--------|
+| 8:45 AM | Selenium auto-login |
+| 9:15 AM | Fetch data, enter position |
+| 9:15 - 3:30 PM | Monitor for Target/SL/Signals |
+| 3:30 PM | Generate daily report |
 
 ---
 
@@ -188,15 +197,27 @@ docker run -p 10000:10000 --env-file .env supertrend-bot
 
 | Issue | Solution |
 |-------|----------|
-| App sleeping | Verify UptimeRobot is pinging `/ping` |
-| No Telegram | Check `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
-| Login fails | Verify Kite credentials in env vars |
-| Chrome error | Ensure Dockerfile installs chromium |
+| 0 candles loaded | Check Kite subscription has Historical API |
+| WebSocket 403 | Check Kite subscription has Streaming API |
+| Bot stuck waiting | Trigger Manual Deploy on Render |
+| No Telegram | Verify bot token and chat ID |
+| Login fails | Check credentials, reset TOTP if needed |
+
+---
+
+## Kite Connect Requirements
+
+Your Kite Connect subscription must include:
+- ✅ Historical Data API
+- ✅ WebSocket Streaming API
+
+Check at [developers.kite.trade](https://developers.kite.trade/)
 
 ---
 
 ## ⚠️ Disclaimer
 
 - Automating Zerodha login may violate their Terms of Service
-- This bot uses paper/simulated capital
+- This bot uses paper/simulated capital (₹1 lakh)
 - Use at your own risk
+- Monitor trades via Telegram
