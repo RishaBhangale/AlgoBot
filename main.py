@@ -253,11 +253,16 @@ class SupertrendTrader:
     
     def _on_candle_close(self, candle: Dict):
         """Handle candle close - check trend and take action."""
+        print(f"\n[DEBUG] [{self.symbol}] _on_candle_close called: {candle['timestamp']}", flush=True)
+        
         self.candles.append(candle)
         if len(self.candles) > 100:
             self.candles = self.candles[-100:]
         
+        print(f"[DEBUG] [{self.symbol}] Total candles: {len(self.candles)}, Need: {ATR_PERIOD + 2}", flush=True)
+        
         if len(self.candles) < ATR_PERIOD + 2:
+            print(f"[DEBUG] [{self.symbol}] Not enough candles yet, waiting...", flush=True)
             return
         
         df = pd.DataFrame(self.candles)
@@ -271,9 +276,12 @@ class SupertrendTrader:
         trend_str = "🟢 BULLISH" if self.current_trend == 1 else "🔴 BEARISH"
         self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.2f} | ST:{self.supertrend_value:.2f} | {trend_str}")
         
+        print(f"[DEBUG] [{self.symbol}] Trend: {self.current_trend}, Prev: {prev_trend}, Position: {self.position is not None}, InitialTaken: {self.initial_position_taken}", flush=True)
+        
         # IMMEDIATE ENTRY: If no position yet, enter based on current trend
         if not self.initial_position_taken and self.current_trend != 0:
             signal = "BUY" if self.current_trend == 1 else "SELL"
+            print(f"[DEBUG] [{self.symbol}] 🎯 TRIGGERING INITIAL ENTRY: {signal}", flush=True)
             self.logger(f"[{self.symbol}] 🎯 Initial entry based on current trend: {signal}")
             self._enter_position(signal, candle)
             self.initial_position_taken = True
@@ -505,6 +513,32 @@ class SupertrendBot:
                 
                 self._log(f"Loaded {len(trader.candles)} candles for {symbol}")
                 print(f"✅ {symbol}: {len(trader.candles)} candles loaded", flush=True)
+                
+                # CALCULATE INITIAL SUPERTREND AND TAKE POSITION IMMEDIATELY
+                if len(trader.candles) >= ATR_PERIOD + 2:
+                    df = pd.DataFrame(trader.candles)
+                    df = calculate_supertrend(df, ATR_PERIOD, ATR_MULTIPLIER)
+                    
+                    latest = df.iloc[-1]
+                    trader.current_trend = int(latest['trend'])
+                    trader.supertrend_value = latest['supertrend']
+                    
+                    trend_str = "🟢 BULLISH" if trader.current_trend == 1 else "🔴 BEARISH"
+                    print(f"📊 [{symbol}] Initial Supertrend: {trader.supertrend_value:.2f} | Trend: {trend_str}", flush=True)
+                    self._log(f"[{symbol}] Initial trend: {trend_str}")
+                    
+                    # TAKE INITIAL POSITION NOW (don't wait for live candle)
+                    if not trader.initial_position_taken and trader.current_trend != 0:
+                        signal = "BUY" if trader.current_trend == 1 else "SELL"
+                        print(f"🎯 [{symbol}] TAKING INITIAL POSITION: {signal}", flush=True)
+                        self._log(f"[{symbol}] 🎯 Initial entry: {signal}")
+                        
+                        # Use last candle data for entry
+                        last_candle = trader.candles[-1]
+                        trader._enter_position(signal, last_candle)
+                        trader.initial_position_taken = True
+                else:
+                    print(f"⚠️ [{symbol}] Not enough candles for Supertrend ({len(trader.candles)} < {ATR_PERIOD + 2})", flush=True)
                 
             except Exception as e:
                 error_msg = f"Error fetching {symbol}: {type(e).__name__}: {e}"
