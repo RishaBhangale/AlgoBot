@@ -165,7 +165,7 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
 
 
 class Position:
-    """Trading position."""
+    """Trading position with hybrid trailing stop-loss."""
     def __init__(self, security: str, option_type: str, strike: int,
                  entry_price: float, target: float, sl: float, 
                  quantity: int, entry_time: datetime, spot_at_entry: float):
@@ -174,14 +174,84 @@ class Position:
         self.strike = strike
         self.entry_price = entry_price
         self.target = target
-        self.sl = sl
+        self.initial_sl = sl  # Original SL (never go back below this)
+        self.sl = sl  # Current trailing SL
         self.quantity = quantity
         self.entry_time = entry_time
         self.spot_at_entry = spot_at_entry
+        self.peak_spot = spot_at_entry  # Track highest (CE) or lowest (PE) spot
         self.exit_price = None
         self.exit_time = None
         self.exit_reason = None
         self.pnl = 0.0
+    
+    def update_trailing_sl(self, current_spot: float, supertrend: float, atr: float) -> bool:
+        """
+        Update trailing SL using hybrid approach (Supertrend + ATR).
+        Returns True if SL was updated.
+        """
+        # Update peak spot
+        if self.option_type == "CE":
+            self.peak_spot = max(self.peak_spot, current_spot)
+        else:
+            self.peak_spot = min(self.peak_spot, current_spot)
+        
+        # Calculate hybrid trailing SL
+        new_sl = self._calculate_hybrid_sl(current_spot, supertrend, atr)
+        
+        # Only move SL in favorable direction (never backward)
+        if self.option_type == "CE":
+            # For CE: SL should only move UP
+            if new_sl > self.sl:
+                old_sl = self.sl
+                self.sl = new_sl
+                return True
+        else:
+            # For PE: SL should only move DOWN (higher is tighter for PE)
+            # But since we track option premium, higher SL is still tighter
+            if new_sl > self.sl:
+                old_sl = self.sl
+                self.sl = new_sl
+                return True
+        
+        return False
+    
+    def _calculate_hybrid_sl(self, current_spot: float, supertrend: float, atr: float) -> float:
+        """
+        Hybrid trailing SL: Use TIGHTER of Supertrend-based or ATR-based.
+        """
+        # Calculate estimated option price based on spot movement
+        delta = 0.5 if self.option_type == "CE" else -0.5
+        spot_move = current_spot - self.spot_at_entry
+        current_opt_price = self.entry_price + (spot_move * delta)
+        
+        # Option A: Supertrend-based SL (with small buffer)
+        if self.option_type == "CE":
+            # For CE: If spot drops to supertrend, exit
+            st_spot_sl = supertrend - 0.5  # Small buffer
+            st_move = st_spot_sl - self.spot_at_entry
+            sl_option_a = max(0.05, self.entry_price + (st_move * delta))
+        else:
+            # For PE: If spot rises to supertrend, exit
+            st_spot_sl = supertrend + 0.5
+            st_move = st_spot_sl - self.spot_at_entry
+            sl_option_a = max(0.05, self.entry_price + (st_move * delta))
+        
+        # Option B: ATR-based SL (2x ATR from peak)
+        if self.option_type == "CE":
+            atr_spot_sl = self.peak_spot - (atr * 2.0)
+            atr_move = atr_spot_sl - self.spot_at_entry
+            sl_option_b = max(0.05, self.entry_price + (atr_move * delta))
+        else:
+            atr_spot_sl = self.peak_spot + (atr * 2.0)
+            atr_move = atr_spot_sl - self.spot_at_entry
+            sl_option_b = max(0.05, self.entry_price + (atr_move * delta))
+        
+        # Use the HIGHER (more protective) SL
+        new_sl = max(sl_option_a, sl_option_b)
+        
+        # Never go below initial SL
+        return max(new_sl, self.initial_sl)
     
     def close(self, exit_price: float, reason: str):
         self.exit_price = exit_price
@@ -213,6 +283,7 @@ class SupertrendTrader:
         
         self.current_trend: int = 0  # 1 = BULLISH, -1 = BEARISH
         self.supertrend_value: float = 0
+        self.current_atr: float = 0  # Track ATR for trailing SL
         self.initial_position_taken: bool = False  # Track if we've entered initial position
         
         self.position: Optional[Position] = None
@@ -260,7 +331,7 @@ class SupertrendTrader:
                 self._check_exit(ltp)
     
     def _on_candle_close(self, candle: Dict):
-        """Handle candle close - check trend and take action."""
+        """Handle candle close - check trend, update trailing SL, and take action."""
         print(f"\n[DEBUG] [{self.symbol}] _on_candle_close called: {candle['timestamp']}", flush=True)
         
         self.candles.append(candle)
@@ -280,9 +351,31 @@ class SupertrendTrader:
         prev_trend = self.current_trend
         self.current_trend = int(latest['trend'])
         self.supertrend_value = latest['supertrend']
+        self.current_atr = latest['atr']  # Save ATR for trailing SL
         
         trend_str = "🟢 BULLISH" if self.current_trend == 1 else "🔴 BEARISH"
-        self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.2f} | ST:{self.supertrend_value:.2f} | {trend_str}")
+        self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.2f} | ST:{self.supertrend_value:.2f} | ATR:{self.current_atr:.2f} | {trend_str}")
+        
+        # UPDATE TRAILING SL on every candle close if we have a position
+        if self.position:
+            old_sl = self.position.sl
+            sl_updated = self.position.update_trailing_sl(
+                current_spot=candle['close'],
+                supertrend=self.supertrend_value,
+                atr=self.current_atr
+            )
+            if sl_updated:
+                print(f"📈 [{self.symbol}] TRAILING SL UPDATED: ₹{old_sl:.2f} → ₹{self.position.sl:.2f}", flush=True)
+                self.logger(f"[{self.symbol}] 📈 Trailing SL: ₹{old_sl:.2f} → ₹{self.position.sl:.2f}")
+                
+                # Notify via Telegram about SL update
+                if self.telegram:
+                    self.telegram.send_message(
+                        f"📈 *{self.symbol} Trailing SL Updated*\n"
+                        f"Old SL: ₹{old_sl:.2f}\n"
+                        f"New SL: ₹{self.position.sl:.2f}\n"
+                        f"Peak: ₹{self.position.peak_spot:.2f}"
+                    )
         
         print(f"[DEBUG] [{self.symbol}] Trend: {self.current_trend}, Prev: {prev_trend}, Position: {self.position is not None}, InitialTaken: {self.initial_position_taken}", flush=True)
         
@@ -543,10 +636,11 @@ class SupertrendBot:
                     latest = df.iloc[-1]
                     trader.current_trend = int(latest['trend'])
                     trader.supertrend_value = latest['supertrend']
+                    trader.current_atr = latest['atr']  # Save ATR for trailing SL
                     
                     trend_str = "🟢 BULLISH" if trader.current_trend == 1 else "🔴 BEARISH"
-                    print(f"📊 [{symbol}] Initial Supertrend: {trader.supertrend_value:.2f} | Trend: {trend_str}", flush=True)
-                    self._log(f"[{symbol}] Initial trend: {trend_str}")
+                    print(f"📊 [{symbol}] Initial Supertrend: {trader.supertrend_value:.2f} | ATR: {trader.current_atr:.2f} | Trend: {trend_str}", flush=True)
+                    self._log(f"[{symbol}] Initial trend: {trend_str} | ATR: {trader.current_atr:.2f}")
                     
                     # TAKE INITIAL POSITION NOW (don't wait for live candle)
                     if not trader.initial_position_taken and trader.current_trend != 0:
