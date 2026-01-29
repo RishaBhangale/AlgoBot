@@ -219,11 +219,19 @@ class SupertrendTrader:
         self.trades: List[Position] = []
         self.signals: List[Dict] = []
         
+        self.tick_count: int = 0  # Track ticks received
+        self.candle_count: int = 0  # Track candles processed
+        
         self.lock = Lock()
     
     def process_tick(self, ltp: float, tick_time: datetime):
         """Process incoming tick and build candles."""
         with self.lock:
+            self.tick_count += 1
+            
+            # Log every 100th tick to show activity
+            if self.tick_count % 100 == 0:
+                print(f"[TICK] [{self.symbol}] #{self.tick_count} LTP: {ltp:.2f}, Candles: {len(self.candles)}", flush=True)
             candle_minute = (tick_time.minute // TIMEFRAME_MINUTES) * TIMEFRAME_MINUTES
             candle_start = tick_time.replace(minute=candle_minute, second=0, microsecond=0)
             
@@ -290,14 +298,26 @@ class SupertrendTrader:
         # SIGNAL CHANGE: Close existing position and enter new one
         if prev_trend != 0 and self.current_trend != prev_trend:
             new_signal = "BUY" if self.current_trend == 1 else "SELL"
+            print(f"\n🔄🔄🔄 [{self.symbol}] SIGNAL CHANGE DETECTED! 🔄🔄🔄", flush=True)
+            print(f"    Previous: {'BULLISH' if prev_trend == 1 else 'BEARISH'} -> New: {'BULLISH' if self.current_trend == 1 else 'BEARISH'}", flush=True)
             self.logger(f"[{self.symbol}] 🔄 Trend changed! New signal: {new_signal}")
             
             # Close existing position if any
             if self.position:
+                print(f"[DEBUG] [{self.symbol}] Closing existing position on signal change", flush=True)
                 self._close_position(candle["close"], "SIGNAL_CHANGE")
+            else:
+                print(f"[DEBUG] [{self.symbol}] No existing position to close", flush=True)
             
             # Enter new position
+            print(f"[DEBUG] [{self.symbol}] Entering new position: {new_signal}", flush=True)
             self._enter_position(new_signal, candle)
+        else:
+            # Log why signal change didn't trigger
+            if prev_trend == 0:
+                print(f"[DEBUG] [{self.symbol}] No signal change: prev_trend was 0", flush=True)
+            elif self.current_trend == prev_trend:
+                pass  # Same trend, no action needed (normal case)
     
     def _enter_position(self, signal: str, candle: Dict):
         """Enter a new position based on signal."""
@@ -489,9 +509,10 @@ class SupertrendBot:
             try:
                 config = SECURITIES[symbol]
                 to_date = now_ist()
-                from_date = to_date - timedelta(hours=4)
+                # Look back 5 days to ensure we get enough candles (covers weekends + holidays)
+                from_date = to_date - timedelta(days=5)
                 
-                print(f"📊 Fetching {symbol} from {from_date} to {to_date}...", flush=True)
+                print(f"📊 Fetching {symbol} from {from_date.strftime('%Y-%m-%d %H:%M')} to {to_date.strftime('%Y-%m-%d %H:%M')}...", flush=True)
                 
                 data = self.kite.historical_data(
                     instrument_token=config["instrument_token"],
