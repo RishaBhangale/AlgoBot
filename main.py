@@ -150,10 +150,12 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
             df.loc[df.index[i], 'trend'] = df['trend'].iloc[i-1]
         
         # Supertrend value
+        # BULLISH (trend=1): Supertrend = Lower band (support level)
+        # BEARISH (trend=-1): Supertrend = Upper band (resistance level)
         if df['trend'].iloc[i] == 1:
-            df.loc[df.index[i], 'supertrend'] = df['upper_band'].iloc[i]
-        else:
             df.loc[df.index[i], 'supertrend'] = df['lower_band'].iloc[i]
+        else:
+            df.loc[df.index[i], 'supertrend'] = df['upper_band'].iloc[i]
     
     # Signals
     df['prev_trend'] = df['trend'].shift(1)

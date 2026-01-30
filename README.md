@@ -1,6 +1,6 @@
 # Supertrend Trading Bot
 
-Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifications.
+Fully automated paper trading bot for NIFTY and BANKNIFTY with Telegram notifications and **hybrid trailing stop-loss**.
 
 ## Strategy
 
@@ -9,20 +9,47 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 | **Indicator** | Supertrend (ATR Period: 10, Multiplier: 3.0) |
 | **Timeframe** | 5 minutes |
 | **Target** | +20% profit |
-| **Stop Loss** | -10% loss |
+| **Initial SL** | -10% loss |
+| **Trailing SL** | Hybrid (Supertrend + ATR based) |
 | **Entry** | Immediate on current trend |
-| **Exit** | Target hit, SL hit, or Signal change |
+| **Exit** | Target hit, Trailing SL hit, or Signal change |
 | **Hold** | Till expiry (not daily) |
-| **Capital** | ₹1,00,000 (simulated) |
+| **Capital** | ₹1,00,000 (paper trading) |
 
 ## Trading Rules
 
-1. **Bot starts** → Checks current Supertrend trend
-2. **BULLISH trend** → Buys 1 lot CE (ATM strike)
-3. **BEARISH trend** → Buys 1 lot PE (ATM strike)
-4. **Monitors** every tick for Target (20%) / SL (10%)
-5. **Signal changes** → Closes old position, opens new one
-6. **Market closes** → Position held till next day/expiry
+1. **Bot starts** → Fetches 5 days historical data
+2. **Calculates Supertrend** → Determines current trend
+3. **BULLISH trend** → Buys 1 lot CE (ATM strike)
+4. **BEARISH trend** → Buys 1 lot PE (ATM strike)
+5. **Every candle** → Updates trailing SL (never goes backward)
+6. **Every tick** → Checks for Target (20%) / Trailing SL hit
+7. **Signal changes** → Closes position, opens new one
+
+## Hybrid Trailing Stop-Loss
+
+The bot uses a hybrid trailing SL that combines:
+
+| Method | Formula |
+|--------|---------|
+| **Supertrend-based** | SL at Supertrend value ± buffer |
+| **ATR-based** | SL at Peak - (2 × ATR) |
+| **Final SL** | `MAX(Supertrend SL, ATR SL)` - Uses tighter/more protective |
+
+### Example Flow
+```
+Entry CE @ ₹100, Spot: 23,000
+Initial SL: ₹90 (-10%)
+
+Candle 1: Spot rises to 23,100
+  → Trailing SL moves to ₹100 (breakeven!)
+
+Candle 2: Spot rises to 23,200  
+  → Trailing SL moves to ₹105
+
+Candle 3: Spot dips to 23,100
+  → Exit at ₹105 (locked in +5% profit)
+```
 
 ## Securities
 
@@ -31,51 +58,37 @@ Fully automated options trading bot for NIFTY and BANKNIFTY with Telegram notifi
 | NIFTY | 50 | 50 |
 | BANKNIFTY | 25 | 100 |
 
+## Daily Schedule
+
+| Time | Action |
+|------|--------|
+| 8:30 AM | Bot wakes up |
+| 8:45 AM | Selenium auto-login (fresh token) |
+| 9:15 AM | Fetch data, calculate Supertrend, enter position |
+| 9:15 - 3:30 PM | Monitor for Target/SL/Signals, trail SL |
+| 3:30 PM | Generate daily report |
+| Next day | Repeat with fresh login |
+
 ## Tech Stack
 
 - **Framework**: FastAPI + Uvicorn
 - **Automation**: Selenium + Chromium (headless)
 - **Containerization**: Docker
 - **Hosting**: Render (free tier)
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│       Docker Container (Render)         │
-│  ┌─────────────────────────────────┐    │
-│  │  FastAPI Server (uvicorn)       │    │
-│  │  - /       → Health check       │◄───┼─── UptimeRobot (every 5 min)
-│  │  - /ping   → Ping               │    │
-│  │  - /status → Bot status JSON    │    │
-│  │  - /logs   → Recent bot logs    │    │
-│  └─────────────┬───────────────────┘    │
-│                │                        │
-│  ┌─────────────▼───────────────────┐    │
-│  │  Background Thread              │    │
-│  │  - 8:45 AM: Selenium login      │    │
-│  │  - 9:15 AM: Start trading       │───►├─── Telegram Alerts
-│  │  - 3:30 PM: Generate report     │    │
-│  └─────────────────────────────────┘    │
-│                                         │
-│  System: Chromium + ChromeDriver        │
-└─────────────────────────────────────────┘
-```
+- **Notifications**: Telegram Bot
 
 ## Files
 
 ```
 supertrend-bot/
-├── app.py               # FastAPI server (entry point)
-├── main.py              # Trading bot core
+├── app.py               # FastAPI server + daily loop
+├── main.py              # Trading bot core + trailing SL
 ├── auto_login.py        # Selenium auto-login
 ├── telegram_notifier.py # Telegram notifications
 ├── Dockerfile           # Docker config with Chromium
 ├── render.yaml          # Render deployment config
 ├── requirements.txt     # Python dependencies
-├── .env.example         # Environment template
-├── .gitignore           # Git ignore rules
-└── logs/                # Daily logs & reports
+└── .env.example         # Environment template
 ```
 
 ---
@@ -110,51 +123,16 @@ TELEGRAM_CHAT_ID=your_chat_id
 
 ```bash
 python3 app.py
-# or
-uvicorn app:app --host 0.0.0.0 --port 5000
 ```
 
 ---
 
 ## Cloud Deployment (Render)
 
-### Step 1: Push to GitHub
-
-```bash
-git add .
-git commit -m "Deploy trading bot"
-git push origin main
-```
-
-### Step 2: Deploy on Render
-
-1. Go to [render.com](https://render.com)
-2. Click **New** → **Web Service**
-3. Connect your GitHub repository
-4. Render auto-detects `Dockerfile`
-5. Add **Environment Variables**:
-
-| Variable | Description |
-|----------|-------------|
-| `KITE_API_KEY` | Kite Connect API key |
-| `KITE_API_SECRET` | Kite Connect API secret |
-| `KITE_USER_ID` | Zerodha user ID |
-| `KITE_PASSWORD` | Zerodha password |
-| `KITE_TOTP_SECRET` | TOTP secret for 2FA |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | Your chat ID |
-
-6. Click **Create Web Service**
-
-### Step 3: Setup UptimeRobot
-
-Render free tier sleeps after 15 mins inactivity.
-
-1. Go to [uptimerobot.com](https://uptimerobot.com)
-2. Add New Monitor:
-   - Type: HTTP(s)
-   - URL: `https://your-app.onrender.com/ping`
-   - Interval: 5 minutes
+1. Push to GitHub
+2. Create Web Service on [render.com](https://render.com)
+3. Add environment variables
+4. Setup UptimeRobot for keep-alive pings
 
 ---
 
@@ -162,7 +140,7 @@ Render free tier sleeps after 15 mins inactivity.
 
 | Endpoint | Description |
 |----------|-------------|
-| `/` | Health check status |
+| `/` | Health check with status and trading day |
 | `/ping` | Simple ping for UptimeRobot |
 | `/status` | Detailed bot status (JSON) |
 | `/logs` | Recent 50 log entries |
@@ -177,19 +155,9 @@ Render free tier sleeps after 15 mins inactivity.
 |-------|---------|
 | Bot Start | Securities, strategy details |
 | Trade Entry | CE/PE, Strike, Entry, Target, SL, Qty |
-| Trade Exit | Exit price, P&L, Reason (TARGET/SL/SIGNAL_CHANGE) |
+| **Trailing SL Update** | Old SL → New SL, Peak price |
+| Trade Exit | Exit price, P&L, Reason |
 | Daily Summary | All trades, wins, losses, total P&L |
-
----
-
-## Daily Schedule
-
-| Time | Action |
-|------|--------|
-| 8:45 AM | Selenium auto-login |
-| 9:15 AM | Fetch data, enter position |
-| 9:15 - 3:30 PM | Monitor for Target/SL/Signals |
-| 3:30 PM | Generate daily report |
 
 ---
 
@@ -197,11 +165,11 @@ Render free tier sleeps after 15 mins inactivity.
 
 | Issue | Solution |
 |-------|----------|
-| 0 candles loaded | Check Kite subscription has Historical API |
-| WebSocket 403 | Check Kite subscription has Streaming API |
-| Bot stuck waiting | Trigger Manual Deploy on Render |
+| 0 candles loaded | Historical data API issue - wait or check subscription |
+| Extra signals vs TradingView | Ensure same ATR period (10) and multiplier (3.0) |
+| WebSocket 403 | Kite streaming subscription required |
+| Bot not trading | Check `/logs` endpoint for errors |
 | No Telegram | Verify bot token and chat ID |
-| Login fails | Check credentials, reset TOTP if needed |
 
 ---
 
@@ -211,13 +179,11 @@ Your Kite Connect subscription must include:
 - ✅ Historical Data API
 - ✅ WebSocket Streaming API
 
-Check at [developers.kite.trade](https://developers.kite.trade/)
-
 ---
 
 ## ⚠️ Disclaimer
 
-- Automating Zerodha login may violate their Terms of Service
 - This bot uses paper/simulated capital (₹1 lakh)
+- No real orders are placed
+- Automating Zerodha login may violate their TOS
 - Use at your own risk
-- Monitor trades via Telegram
