@@ -97,8 +97,15 @@ def now_ist():
 
 def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
     """
-    Calculate Supertrend indicator.
-    Returns DataFrame with 'supertrend', 'trend', and 'signal' columns.
+    Calculate Supertrend indicator - MATCHES TRADINGVIEW PINESCRIPT EXACTLY.
+    
+    TradingView naming:
+    - up = hl2 - (mult * atr) = SUPPORT line (shown when bullish)
+    - dn = hl2 + (mult * atr) = RESISTANCE line (shown when bearish)
+    
+    Trend switching:
+    - Bearish to Bullish: close > dn (crosses above resistance)
+    - Bullish to Bearish: close < up (crosses below support)
     """
     df = df.copy()
     
@@ -111,53 +118,64 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
         )
     )
     
-    # ATR
-    df['atr'] = df['tr'].rolling(window=period).mean()
+    # ATR (using SMA like TradingView's atr() function)
+    df['atr'] = df['tr'].ewm(span=period, adjust=False).mean()
     
-    # HL2
+    # HL2 (source)
     df['hl2'] = (df['high'] + df['low']) / 2
     
-    # Basic bands
-    df['basic_upper'] = df['hl2'] - (multiplier * df['atr'])
-    df['basic_lower'] = df['hl2'] + (multiplier * df['atr'])
+    # Basic bands (TradingView naming)
+    # up = support line, dn = resistance line
+    df['basic_up'] = df['hl2'] - (multiplier * df['atr'])  # Support
+    df['basic_dn'] = df['hl2'] + (multiplier * df['atr'])  # Resistance
     
-    # Initialize
-    df['upper_band'] = 0.0
-    df['lower_band'] = 0.0
+    # Initialize final bands
+    df['up'] = df['basic_up']  # Support (plotted when bullish)
+    df['dn'] = df['basic_dn']  # Resistance (plotted when bearish)
     df['trend'] = 1
     df['supertrend'] = 0.0
     
-    # Calculate iteratively
-    for i in range(period, len(df)):
-        # Upper band
-        if df['close'].iloc[i-1] > df['upper_band'].iloc[i-1]:
-            df.loc[df.index[i], 'upper_band'] = max(df['basic_upper'].iloc[i], df['upper_band'].iloc[i-1])
+    # Calculate iteratively (matching PineScript logic exactly)
+    for i in range(1, len(df)):
+        # Up band (support) - only moves UP, never down
+        # up := close[1] > up1 ? max(up, up1) : up
+        if df['close'].iloc[i-1] > df['up'].iloc[i-1]:
+            df.loc[df.index[i], 'up'] = max(df['basic_up'].iloc[i], df['up'].iloc[i-1])
         else:
-            df.loc[df.index[i], 'upper_band'] = df['basic_upper'].iloc[i]
+            df.loc[df.index[i], 'up'] = df['basic_up'].iloc[i]
         
-        # Lower band
-        if df['close'].iloc[i-1] < df['lower_band'].iloc[i-1]:
-            df.loc[df.index[i], 'lower_band'] = min(df['basic_lower'].iloc[i], df['lower_band'].iloc[i-1])
+        # Down band (resistance) - only moves DOWN, never up
+        # dn := close[1] < dn1 ? min(dn, dn1) : dn
+        if df['close'].iloc[i-1] < df['dn'].iloc[i-1]:
+            df.loc[df.index[i], 'dn'] = min(df['basic_dn'].iloc[i], df['dn'].iloc[i-1])
         else:
-            df.loc[df.index[i], 'lower_band'] = df['basic_lower'].iloc[i]
+            df.loc[df.index[i], 'dn'] = df['basic_dn'].iloc[i]
         
-        # Trend
-        if df['trend'].iloc[i-1] == -1 and df['close'].iloc[i] > df['lower_band'].iloc[i-1]:
+        # Trend switching (EXACTLY like TradingView)
+        # trend := trend == -1 and close > dn1 ? 1 : trend == 1 and close < up1 ? -1 : trend
+        prev_trend = df['trend'].iloc[i-1]
+        if prev_trend == -1 and df['close'].iloc[i] > df['dn'].iloc[i-1]:
+            # Bearish to Bullish: close crosses ABOVE resistance (dn)
             df.loc[df.index[i], 'trend'] = 1
-        elif df['trend'].iloc[i-1] == 1 and df['close'].iloc[i] < df['upper_band'].iloc[i-1]:
+        elif prev_trend == 1 and df['close'].iloc[i] < df['up'].iloc[i-1]:
+            # Bullish to Bearish: close crosses BELOW support (up)
             df.loc[df.index[i], 'trend'] = -1
         else:
-            df.loc[df.index[i], 'trend'] = df['trend'].iloc[i-1]
+            df.loc[df.index[i], 'trend'] = prev_trend
         
-        # Supertrend value
-        # BULLISH (trend=1): Supertrend = Lower band (support level)
-        # BEARISH (trend=-1): Supertrend = Upper band (resistance level)
+        # Supertrend value (the line shown on chart)
+        # Bullish: show support line (up)
+        # Bearish: show resistance line (dn)
         if df['trend'].iloc[i] == 1:
-            df.loc[df.index[i], 'supertrend'] = df['lower_band'].iloc[i]
+            df.loc[df.index[i], 'supertrend'] = df['up'].iloc[i]
         else:
-            df.loc[df.index[i], 'supertrend'] = df['upper_band'].iloc[i]
+            df.loc[df.index[i], 'supertrend'] = df['dn'].iloc[i]
     
-    # Signals
+    # Rename for compatibility with rest of code
+    df['upper_band'] = df['dn']  # Resistance
+    df['lower_band'] = df['up']  # Support
+    
+    # Signals (trend change)
     df['prev_trend'] = df['trend'].shift(1)
     df['signal'] = None
     df.loc[(df['trend'] == 1) & (df['prev_trend'] == -1), 'signal'] = 'BUY'
