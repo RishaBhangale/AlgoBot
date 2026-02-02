@@ -425,12 +425,17 @@ class SupertrendTrader:
             # Enter new position
             print(f"[DEBUG] [{self.symbol}] Entering new position: {new_signal}", flush=True)
             self._enter_position(new_signal, candle)
-        else:
-            # Log why signal change didn't trigger
-            if prev_trend == 0:
-                print(f"[DEBUG] [{self.symbol}] No signal change: prev_trend was 0", flush=True)
-            elif self.current_trend == prev_trend:
-                pass  # Same trend, no action needed (normal case)
+            return
+        
+        # RE-ENTRY: If no position but trend is active (after Target/SL hit), re-enter
+        if self.position is None and self.current_trend != 0 and self.initial_position_taken:
+            signal = "BUY" if self.current_trend == 1 else "SELL"
+            print(f"\n🔁 [{self.symbol}] RE-ENTERING (no position but trend active): {signal}", flush=True)
+            self.logger(f"[{self.symbol}] 🔁 Re-entering after Target/SL: {signal}")
+            self._enter_position(signal, candle)
+            return
+        
+        # No action needed
     
     def _enter_position(self, signal: str, candle: Dict):
         """Enter a new position based on signal."""
@@ -627,14 +632,33 @@ class SupertrendBot:
                 
                 print(f"📊 Fetching {symbol} from {from_date.strftime('%Y-%m-%d %H:%M')} to {to_date.strftime('%Y-%m-%d %H:%M')}...", flush=True)
                 
-                data = self.kite.historical_data(
-                    instrument_token=config["instrument_token"],
-                    from_date=from_date,
-                    to_date=to_date,
-                    interval="5minute"
-                )
+                # Try fetching with retry logic
+                data = []
+                for days_back in [5, 10, 3, 1]:  # Try different ranges
+                    try:
+                        from_date = to_date - timedelta(days=days_back)
+                        print(f"   Trying {days_back} days back: {from_date.strftime('%Y-%m-%d')} to {to_date.strftime('%Y-%m-%d')}...", flush=True)
+                        
+                        data = self.kite.historical_data(
+                            instrument_token=config["instrument_token"],
+                            from_date=from_date,
+                            to_date=to_date,
+                            interval="5minute"
+                        )
+                        
+                        if len(data) > 0:
+                            print(f"   ✓ Got {len(data)} candles", flush=True)
+                            break
+                        else:
+                            print(f"   ✗ 0 candles, trying different range...", flush=True)
+                    except Exception as retry_err:
+                        print(f"   ✗ Error: {retry_err}", flush=True)
+                        continue
                 
-                print(f"   Got {len(data)} candles from API", flush=True)
+                if len(data) == 0:
+                    print(f"⚠️ {symbol}: Failed to fetch historical data after all retries!", flush=True)
+                    self._log(f"⚠️ {symbol}: No historical data available")
+                    continue
                 
                 for candle in data[-50:]:
                     trader.candles.append({
