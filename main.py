@@ -425,17 +425,6 @@ class SupertrendTrader:
             # Enter new position
             print(f"[DEBUG] [{self.symbol}] Entering new position: {new_signal}", flush=True)
             self._enter_position(new_signal, candle)
-            return
-        
-        # RE-ENTRY: If no position but trend is active (after Target/SL hit), re-enter
-        if self.position is None and self.current_trend != 0 and self.initial_position_taken:
-            signal = "BUY" if self.current_trend == 1 else "SELL"
-            print(f"\n🔁 [{self.symbol}] RE-ENTERING (no position but trend active): {signal}", flush=True)
-            self.logger(f"[{self.symbol}] 🔁 Re-entering after Target/SL: {signal}")
-            self._enter_position(signal, candle)
-            return
-        
-        # No action needed
     
     def _enter_position(self, signal: str, candle: Dict):
         """Enter a new position based on signal."""
