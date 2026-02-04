@@ -18,6 +18,12 @@ except ImportError:
     SmartConnect = None
     SmartWebSocketV2 = None
 
+try:
+    import pyotp
+    PYOTP_AVAILABLE = True
+except ImportError:
+    PYOTP_AVAILABLE = False
+
 
 class AngelOnePCR:
     """
@@ -49,29 +55,38 @@ class AngelOnePCR:
         self.connected: bool = False
         self.last_update: Optional[datetime] = None
         
-        # Credentials
+        # Credentials (MPIN-based login)
         self.api_key = os.environ.get("ANGEL_API_KEY", "")
         self.secret_key = os.environ.get("ANGEL_SECRET_KEY", "")
         self.client_id = os.environ.get("ANGEL_CLIENT_ID", "")
-        self.password = os.environ.get("ANGEL_PASSWORD", "")
+        self.mpin = os.environ.get("ANGEL_MPIN", "")
+        self.totp_secret = os.environ.get("ANGEL_TOTP_SECRET", "")
     
     def login(self) -> bool:
-        """Login to Angel One SmartAPI."""
+        """Login to Angel One SmartAPI using MPIN + TOTP."""
         if not SMARTAPI_AVAILABLE:
             self.logger("⚠️ SmartAPI not installed. Run: pip install smartapi-python")
             return False
         
-        if not self.api_key or not self.client_id:
+        if not PYOTP_AVAILABLE:
+            self.logger("⚠️ pyotp not installed. Run: pip install pyotp")
+            return False
+        
+        if not self.api_key or not self.client_id or not self.mpin:
             self.logger("⚠️ Angel One credentials not configured")
             return False
         
         try:
             self.smart_api = SmartConnect(api_key=self.api_key)
             
-            # Try login without TOTP (if 2FA not enabled)
+            # Generate TOTP
+            totp = pyotp.TOTP(self.totp_secret).now() if self.totp_secret else ""
+            
+            # Login with MPIN + TOTP
             data = self.smart_api.generateSession(
                 clientCode=self.client_id,
-                password=self.password
+                password=self.mpin,
+                totp=totp
             )
             
             if data.get('status'):

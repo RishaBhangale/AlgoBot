@@ -32,3 +32,6 @@ Thumbs.db
 
 # Charts (generated files)
 charts/*.png
+
+# Test files (may contain credentials)
+test*.py
