@@ -56,16 +56,19 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 CORPUS = 100000
-TIMEFRAME_MINUTES = 5
+TIMEFRAME_MINUTES = 15  # Changed from 5 to 15 for Triple-Confirmation
 
-# Supertrend Parameters
-ATR_PERIOD = 10
-ATR_MULTIPLIER = 3.0
+# Supertrend Parameters (20, 2) as per strategy document
+ATR_PERIOD = 20
+ATR_MULTIPLIER = 2.0
 
-# Securities configuration
-# Target: 20%, SL: 10% for all
-TARGET_PCT = 20
-SL_PCT = 10
+# MACD Parameters
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+# No fixed target - exit on reversal only
+# SL is dynamic based on previous candle
 
 SECURITIES = {
     "NIFTY": {
@@ -74,8 +77,6 @@ SECURITIES = {
         "lot_size": 50,
         "strike_interval": 50,
         "option_prefix": "NIFTY",
-        "target_pct": TARGET_PCT,
-        "sl_pct": SL_PCT,
     },
     "BANKNIFTY": {
         "name": "BANK NIFTY",
@@ -83,8 +84,6 @@ SECURITIES = {
         "lot_size": 25,
         "strike_interval": 100,
         "option_prefix": "BANKNIFTY",
-        "target_pct": TARGET_PCT,
-        "sl_pct": SL_PCT,
     },
 }
 
@@ -180,6 +179,64 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
     df['signal'] = None
     df.loc[(df['trend'] == 1) & (df['prev_trend'] == -1), 'signal'] = 'BUY'
     df.loc[(df['trend'] == -1) & (df['prev_trend'] == 1), 'signal'] = 'SELL'
+    
+    return df
+
+
+def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """
+    Calculate MACD indicator.
+    Returns DataFrame with macd_line, macd_signal, and crossover columns.
+    """
+    df = df.copy()
+    
+    # EMA calculations
+    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+    
+    # MACD Line and Signal Line
+    df['macd_line'] = ema_fast - ema_slow
+    df['macd_signal'] = df['macd_line'].ewm(span=signal, adjust=False).mean()
+    df['macd_histogram'] = df['macd_line'] - df['macd_signal']
+    
+    # Crossover detection
+    df['macd_prev_line'] = df['macd_line'].shift(1)
+    df['macd_prev_signal'] = df['macd_signal'].shift(1)
+    
+    # Bullish crossover: MACD crosses ABOVE signal (from below)
+    df['macd_bullish_cross'] = (df['macd_line'] > df['macd_signal']) & \
+                                (df['macd_prev_line'] <= df['macd_prev_signal'])
+    
+    # Bearish crossover: MACD crosses BELOW signal (from above)
+    df['macd_bearish_cross'] = (df['macd_line'] < df['macd_signal']) & \
+                                (df['macd_prev_line'] >= df['macd_prev_signal'])
+    
+    return df
+
+
+def calculate_vwap(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate VWAP (Volume Weighted Average Price).
+    Resets daily for intraday trading.
+    """
+    df = df.copy()
+    
+    # Check if volume data exists
+    if 'volume' not in df.columns or df['volume'].sum() == 0:
+        # If no volume, use simple average as fallback
+        df['vwap'] = (df['high'] + df['low'] + df['close']) / 3
+        return df
+    
+    # Typical Price
+    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+    
+    # Cumulative values (resets daily for proper VWAP)
+    df['tp_volume'] = df['typical_price'] * df['volume']
+    df['cumulative_tp_vol'] = df['tp_volume'].cumsum()
+    df['cumulative_volume'] = df['volume'].cumsum()
+    
+    # VWAP
+    df['vwap'] = df['cumulative_tp_vol'] / df['cumulative_volume']
     
     return df
 
@@ -282,36 +339,53 @@ class Position:
 
 class SupertrendTrader:
     """
-    Handles Supertrend trading for one security.
+    Triple-Confirmation Trading for one security.
     
-    Rules:
-    - Enter position immediately based on current trend (BULLISH → CE, BEARISH → PE)
-    - Target: 20%, SL: 10%
-    - Hold till expiry (not daily)
-    - Close only on: signal change, target hit, or SL hit
+    Entry Conditions (ALL must align):
+    - MACD: Bullish/Bearish crossover
+    - SuperTrend: Bullish/Bearish trend
+    - VWAP: Price below (for BUY) or above (for SELL)
+    - PCR: Bullish (<1.0) for BUY, Bearish (>1.0) for SELL
+    
+    Exit Conditions (ANY triggers exit):
+    - MACD reversal (crossover in opposite direction)
+    - SuperTrend reversal
+    - SL hit (previous candle low/high)
     """
     
-    def __init__(self, symbol: str, config: Dict, logger, telegram: 'TelegramNotifier' = None):
+    def __init__(self, symbol: str, config: Dict, logger, telegram: 'TelegramNotifier' = None, pcr_tracker=None):
         self.symbol = symbol
         self.config = config
         self.logger = logger
         self.telegram = telegram
+        self.pcr_tracker = pcr_tracker  # Angel One PCR instance
         
         self.candles: List[Dict] = []
         self.current_candle: Optional[Dict] = None
         self.last_candle_time: Optional[datetime] = None
         
-        self.current_trend: int = 0  # 1 = BULLISH, -1 = BEARISH
+        # Indicator values
+        self.current_trend: int = 0  # SuperTrend: 1 = BULLISH, -1 = BEARISH
         self.supertrend_value: float = 0
-        self.current_atr: float = 0  # Track ATR for trailing SL
-        self.initial_position_taken: bool = False  # Track if we've entered initial position
+        self.current_atr: float = 0
+        
+        # MACD values
+        self.macd_line: float = 0
+        self.macd_signal: float = 0
+        self.macd_bullish: bool = False  # True if MACD just crossed bullish
+        self.macd_bearish: bool = False  # True if MACD just crossed bearish
+        
+        # VWAP
+        self.vwap: float = 0
+        
+        self.initial_position_taken: bool = False
         
         self.position: Optional[Position] = None
         self.trades: List[Position] = []
         self.signals: List[Dict] = []
         
-        self.tick_count: int = 0  # Track ticks received
-        self.candle_count: int = 0  # Track candles processed
+        self.tick_count: int = 0
+        self.candle_count: int = 0
         
         self.lock = Lock()
     
@@ -351,83 +425,114 @@ class SupertrendTrader:
                 self._check_exit(ltp)
     
     def _on_candle_close(self, candle: Dict):
-        """Handle candle close - check trend, update trailing SL, and take action."""
+        """Handle candle close - Triple-Confirmation entry/exit logic."""
         print(f"\n[DEBUG] [{self.symbol}] _on_candle_close called: {candle['timestamp']}", flush=True)
         
         self.candles.append(candle)
         if len(self.candles) > 100:
             self.candles = self.candles[-100:]
         
-        print(f"[DEBUG] [{self.symbol}] Total candles: {len(self.candles)}, Need: {ATR_PERIOD + 2}", flush=True)
+        # Need enough candles for indicators
+        min_candles = max(ATR_PERIOD, MACD_SLOW) + 5
+        print(f"[DEBUG] [{self.symbol}] Total candles: {len(self.candles)}, Need: {min_candles}", flush=True)
         
-        if len(self.candles) < ATR_PERIOD + 2:
+        if len(self.candles) < min_candles:
             print(f"[DEBUG] [{self.symbol}] Not enough candles yet, waiting...", flush=True)
             return
         
+        # Calculate all indicators
         df = pd.DataFrame(self.candles)
         df = calculate_supertrend(df, ATR_PERIOD, ATR_MULTIPLIER)
+        df = calculate_macd(df, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        df = calculate_vwap(df)
         
         latest = df.iloc[-1]
+        prev_candle = df.iloc[-2]  # For dynamic SL
+        
+        # Update indicator values
         prev_trend = self.current_trend
+        prev_macd_bullish = self.macd_bullish
+        prev_macd_bearish = self.macd_bearish
+        
         self.current_trend = int(latest['trend'])
         self.supertrend_value = latest['supertrend']
-        self.current_atr = latest['atr']  # Save ATR for trailing SL
+        self.current_atr = latest['atr']
+        self.macd_line = latest['macd_line']
+        self.macd_signal = latest['macd_signal']
+        self.macd_bullish = bool(latest['macd_bullish_cross'])
+        self.macd_bearish = bool(latest['macd_bearish_cross'])
+        self.vwap = latest['vwap']
         
-        trend_str = "🟢 BULLISH" if self.current_trend == 1 else "🔴 BEARISH"
-        self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.2f} | ST:{self.supertrend_value:.2f} | ATR:{self.current_atr:.2f} | {trend_str}")
+        # Log indicator status
+        trend_str = "🟢 BULL" if self.current_trend == 1 else "🔴 BEAR"
+        macd_str = "↑CROSS" if self.macd_bullish else ("↓CROSS" if self.macd_bearish else "—")
+        vwap_pos = "BELOW" if candle['close'] < self.vwap else "ABOVE"
         
-        # UPDATE TRAILING SL on every candle close if we have a position
+        self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.0f} | ST:{self.supertrend_value:.0f} | MACD:{macd_str} | VWAP:{vwap_pos} | {trend_str}")
+        
+        # Get PCR if available
+        pcr = 1.0  # Neutral default
+        pcr_valid = True
+        if self.pcr_tracker:
+            pcr = self.pcr_tracker.get_pcr(self.symbol)
+        
+        # === EXIT LOGIC === 
         if self.position:
-            old_sl = self.position.sl
-            sl_updated = self.position.update_trailing_sl(
-                current_spot=candle['close'],
-                supertrend=self.supertrend_value,
-                atr=self.current_atr
-            )
-            if sl_updated:
-                print(f"📈 [{self.symbol}] TRAILING SL UPDATED: ₹{old_sl:.2f} → ₹{self.position.sl:.2f}", flush=True)
-                self.logger(f"[{self.symbol}] 📈 Trailing SL: ₹{old_sl:.2f} → ₹{self.position.sl:.2f}")
-                
-                # Notify via Telegram about SL update
-                if self.telegram:
-                    self.telegram.send_message(
-                        f"📈 *{self.symbol} Trailing SL Updated*\n"
-                        f"Old SL: ₹{old_sl:.2f}\n"
-                        f"New SL: ₹{self.position.sl:.2f}\n"
-                        f"Peak: ₹{self.position.peak_spot:.2f}"
-                    )
-        
-        print(f"[DEBUG] [{self.symbol}] Trend: {self.current_trend}, Prev: {prev_trend}, Position: {self.position is not None}, InitialTaken: {self.initial_position_taken}", flush=True)
-        
-        # IMMEDIATE ENTRY: If no position yet, enter based on current trend
-        if not self.initial_position_taken and self.current_trend != 0:
-            signal = "BUY" if self.current_trend == 1 else "SELL"
-            print(f"[DEBUG] [{self.symbol}] 🎯 TRIGGERING INITIAL ENTRY: {signal}", flush=True)
-            self.logger(f"[{self.symbol}] 🎯 Initial entry based on current trend: {signal}")
-            self._enter_position(signal, candle)
-            self.initial_position_taken = True
-            return
-        
-        # SIGNAL CHANGE: Close existing position and enter new one
-        if prev_trend != 0 and self.current_trend != prev_trend:
-            new_signal = "BUY" if self.current_trend == 1 else "SELL"
-            print(f"\n🔄🔄🔄 [{self.symbol}] SIGNAL CHANGE DETECTED! 🔄🔄🔄", flush=True)
-            print(f"    Previous: {'BULLISH' if prev_trend == 1 else 'BEARISH'} -> New: {'BULLISH' if self.current_trend == 1 else 'BEARISH'}", flush=True)
-            self.logger(f"[{self.symbol}] 🔄 Trend changed! New signal: {new_signal}")
+            exit_reason = None
             
-            # Close existing position if any
-            if self.position:
-                print(f"[DEBUG] [{self.symbol}] Closing existing position on signal change", flush=True)
-                self._close_position(candle["close"], "SIGNAL_CHANGE")
-            else:
-                print(f"[DEBUG] [{self.symbol}] No existing position to close", flush=True)
+            # Check MACD reversal
+            if self.position.option_type == "CE" and self.macd_bearish:
+                exit_reason = "MACD_REVERSAL"
+            elif self.position.option_type == "PE" and self.macd_bullish:
+                exit_reason = "MACD_REVERSAL"
             
-            # Enter new position
-            print(f"[DEBUG] [{self.symbol}] Entering new position: {new_signal}", flush=True)
-            self._enter_position(new_signal, candle)
+            # Check SuperTrend reversal
+            if self.position.option_type == "CE" and self.current_trend == -1 and prev_trend == 1:
+                exit_reason = "SUPERTREND_REVERSAL"
+            elif self.position.option_type == "PE" and self.current_trend == 1 and prev_trend == -1:
+                exit_reason = "SUPERTREND_REVERSAL"
+            
+            if exit_reason:
+                print(f"\n� [{self.symbol}] EXIT TRIGGERED: {exit_reason}", flush=True)
+                self._close_position(candle["close"], exit_reason)
+        
+        # === ENTRY LOGIC (Triple-Confirmation) ===
+        if self.position is None:
+            buy_confirmed = False
+            sell_confirmed = False
+            
+            # BUY Signal: MACD bullish + SuperTrend bullish + Price below VWAP + PCR < 1.0
+            if self.macd_bullish and self.current_trend == 1:
+                if candle['close'] < self.vwap:
+                    if pcr < 1.0:
+                        buy_confirmed = True
+                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION BUY!", flush=True)
+                        print(f"   MACD: ↑ Crossover | ST: Bullish | VWAP: Below | PCR: {pcr:.2f}", flush=True)
+                    else:
+                        print(f"[DEBUG] [{self.symbol}] BUY blocked: PCR {pcr:.2f} > 1.0", flush=True)
+                else:
+                    print(f"[DEBUG] [{self.symbol}] BUY blocked: Price above VWAP", flush=True)
+            
+            # SELL Signal: MACD bearish + SuperTrend bearish + Price above VWAP + PCR > 1.0
+            if self.macd_bearish and self.current_trend == -1:
+                if candle['close'] > self.vwap:
+                    if pcr > 1.0:
+                        sell_confirmed = True
+                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION SELL!", flush=True)
+                        print(f"   MACD: ↓ Crossover | ST: Bearish | VWAP: Above | PCR: {pcr:.2f}", flush=True)
+                    else:
+                        print(f"[DEBUG] [{self.symbol}] SELL blocked: PCR {pcr:.2f} < 1.0", flush=True)
+                else:
+                    print(f"[DEBUG] [{self.symbol}] SELL blocked: Price below VWAP", flush=True)
+            
+            # Enter position
+            if buy_confirmed:
+                self._enter_position("BUY", candle, prev_candle)
+            elif sell_confirmed:
+                self._enter_position("SELL", candle, prev_candle)
     
-    def _enter_position(self, signal: str, candle: Dict):
-        """Enter a new position based on signal."""
+    def _enter_position(self, signal: str, candle: Dict, prev_candle: Dict = None):
+        """Enter a new position based on Triple-Confirmation signal."""
         spot = candle["close"]
         option_type = "CE" if signal == "BUY" else "PE"
         
@@ -438,9 +543,25 @@ class SupertrendTrader:
         itm = max(0, spot - strike) if option_type == "CE" else max(0, strike - spot)
         entry_price = itm + spot * 0.003 + 20  # Approximate premium
         
-        # Target 20%, SL 10%
-        target = entry_price * (1 + self.config["target_pct"] / 100)
-        sl = entry_price * (1 - self.config["sl_pct"] / 100)
+        # DYNAMIC SL: Based on previous candle low/high
+        # BUY (CE): SL at previous candle LOW
+        # SELL (PE): SL at previous candle HIGH
+        if prev_candle is not None:
+            if signal == "BUY":
+                sl_spot = prev_candle["low"]
+            else:
+                sl_spot = prev_candle["high"]
+            
+            # Convert spot SL to option price SL
+            delta = 0.5 if option_type == "CE" else -0.5
+            sl_move = sl_spot - spot
+            sl = max(0.05, entry_price + (sl_move * delta))
+        else:
+            # Fallback: 10% of entry price
+            sl = entry_price * 0.90
+        
+        # NO FIXED TARGET - exit on reversal only
+        target = entry_price * 5  # Very high target (effectively no target)
         
         self.position = Position(
             security=self.symbol,
@@ -458,19 +579,23 @@ class SupertrendTrader:
             "time": str(candle["timestamp"]),
             "signal": signal,
             "spot": spot,
-            "supertrend": self.supertrend_value
+            "supertrend": self.supertrend_value,
+            "macd_bullish": self.macd_bullish,
+            "macd_bearish": self.macd_bearish,
+            "vwap": self.vwap
         })
         
         emoji = "🟢" if signal == "BUY" else "🔴"
-        self.logger(f"[{self.symbol}] {emoji} {signal} | {option_type} {strike} @ ₹{entry_price:.2f}")
+        sl_points = abs(spot - (prev_candle["low"] if signal == "BUY" else prev_candle["high"])) if prev_candle else 0
+        self.logger(f"[{self.symbol}] {emoji} {signal} | {option_type} {strike} @ ₹{entry_price:.2f} | SL: {sl_points:.0f} pts")
         
         print(f"\n{'='*50}", flush=True)
-        print(f"{emoji} [{self.symbol}] NEW POSITION - {option_type}", flush=True)
-        print(f"   Signal: {signal} (Trend: {'BULLISH' if signal == 'BUY' else 'BEARISH'})", flush=True)
+        print(f"{emoji} [{self.symbol}] TRIPLE-CONFIRMATION ENTRY - {option_type}", flush=True)
+        print(f"   Signal: {signal}", flush=True)
         print(f"   Strike: {strike} | Entry: ₹{entry_price:.2f}", flush=True)
-        print(f"   Target: ₹{target:.2f} (+{self.config['target_pct']}%)", flush=True)
-        print(f"   SL: ₹{sl:.2f} (-{self.config['sl_pct']}%)", flush=True)
-        print(f"   Qty: {self.config['lot_size']} | Hold: Till Expiry", flush=True)
+        print(f"   SL: ₹{sl:.2f} (Prev candle {'low' if signal == 'BUY' else 'high'})", flush=True)
+        print(f"   Target: NONE (Exit on reversal)", flush=True)
+        print(f"   Qty: {self.config['lot_size']}", flush=True)
         print(f"{'='*50}\n", flush=True)
         
         # Telegram notification
