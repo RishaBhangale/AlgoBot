@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Supertrend Bot Web Server Wrapper (FastAPI)
+Triple-Confirmation Trading Bot Web Server (FastAPI)
 Disguises the trading bot as a web service for Render free tier.
 
 Key features:
 - FastAPI responds to health checks IMMEDIATELY
 - Trading bot runs in background thread
 - DAILY LOOP: Re-authenticates each morning with fresh Kite token
+- Strategy: MACD + SuperTrend + VWAP + PCR
 """
 import threading
 import os

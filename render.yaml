@@ -4,6 +4,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     envVars:
+      # Zerodha Kite Connect
       - key: KITE_USER_ID
         sync: false
       - key: KITE_PASSWORD
@@ -14,7 +15,19 @@ services:
         sync: false
       - key: KITE_API_SECRET
         sync: false
+      # Telegram
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
+        sync: false
+      # Angel One (PCR Data)
+      - key: ANGEL_API_KEY
+        sync: false
+      - key: ANGEL_SECRET_KEY
+        sync: false
+      - key: ANGEL_CLIENT_ID
+        sync: false
+      - key: ANGEL_MPIN
+        sync: false
+      - key: ANGEL_TOTP_SECRET
         sync: false
