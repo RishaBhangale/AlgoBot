@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Triple-Confirmation Trading Bot Web Server (FastAPI)
+Quad-Confirmation Trading Bot Web Server (FastAPI)
 Disguises the trading bot as a web service for Render free tier.
 
 Key features:
 - FastAPI responds to health checks IMMEDIATELY
 - Trading bot runs in background thread
 - DAILY LOOP: Re-authenticates each morning with fresh Kite token
-- Strategy: MACD + SuperTrend + VWAP + PCR
+- Strategy: MACD + SuperTrend + VWAP + PCR (with 2-candle MACD lookback)
+
+Environment Variables:
+- TRADING_MODE: "INDEX" (default) or "STOCK"
+- PAPER_TRADING: "true" (default) or "false"
 """
 import threading
 import os
@@ -18,9 +22,28 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-# Import the trading bot and auto-login
-from main import SupertrendBot, SECURITIES, now_ist, KITE_AVAILABLE
+# ============================================================
+# TRADING MODE TOGGLE
+# ============================================================
+TRADING_MODE = os.environ.get("TRADING_MODE", "INDEX").upper()
+PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
+
+print(f"🎯 TRADING_MODE: {TRADING_MODE}", flush=True)
+print(f"📄 PAPER_TRADING: {PAPER_TRADING}", flush=True)
+
+# Dynamic import based on trading mode
+if TRADING_MODE == "STOCK":
+    print("📊 Loading STOCK OPTIONS bot (5 F&O stocks)...", flush=True)
+    from main_stocks import StockOptionsBot as TradingBot, STOCKS as SECURITIES, now_ist, KITE_AVAILABLE
+else:
+    print("📊 Loading INDEX OPTIONS bot (NIFTY/BANKNIFTY)...", flush=True)
+    from main import SupertrendBot as TradingBot, SECURITIES, now_ist, KITE_AVAILABLE
+
+# Alias for compatibility
+SupertrendBot = TradingBot
+
 from auto_login import KiteAutoLogin, load_credentials, SELENIUM_AVAILABLE
+
 
 # Global state
 bot_instance = None
