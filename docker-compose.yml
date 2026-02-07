@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  supertrend-bot:
+    build: .
+    container_name: supertrend-bot
+    ports:
+      - "10000:10000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./logs:/app/logs
+      - ./charts:/app/charts
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# Local development with live reload
+  dev:
+    build: .
+    container_name: supertrend-dev
+    ports:
+      - "10000:10000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    command: uvicorn app:app --host 0.0.0.0 --port 10000 --reload

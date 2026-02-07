@@ -339,11 +339,11 @@ class Position:
 
 class SupertrendTrader:
     """
-    Triple-Confirmation Trading for one security.
+    Quad-Confirmation Trading for one security.
     
-    Entry Conditions (ALL must align):
-    - MACD: Bullish/Bearish crossover
-    - SuperTrend: Bullish/Bearish trend
+    Entry Conditions (with MACD lookback):
+    - MACD: Crossover triggers "pending signal" valid for 2 candles
+    - SuperTrend: Bullish/Bearish trend (can confirm within 2 candles of MACD)
     - VWAP: Price below (for BUY) or above (for SELL)
     - PCR: Bullish (<1.0) for BUY, Bearish (>1.0) for SELL
     
@@ -352,6 +352,9 @@ class SupertrendTrader:
     - SuperTrend reversal
     - SL hit (previous candle low/high)
     """
+    
+    # MACD signal lookback window (in candles)
+    MACD_LOOKBACK_CANDLES = 2
     
     def __init__(self, symbol: str, config: Dict, logger, telegram: 'TelegramNotifier' = None, pcr_tracker=None):
         self.symbol = symbol
@@ -374,6 +377,10 @@ class SupertrendTrader:
         self.macd_signal: float = 0
         self.macd_bullish: bool = False  # True if MACD just crossed bullish
         self.macd_bearish: bool = False  # True if MACD just crossed bearish
+        
+        # MACD Lookback Tracking
+        self.pending_macd_bullish: int = 0  # Countdown of candles remaining
+        self.pending_macd_bearish: int = 0  # Countdown of candles remaining
         
         # VWAP
         self.vwap: float = 0
@@ -493,43 +500,79 @@ class SupertrendTrader:
                 exit_reason = "SUPERTREND_REVERSAL"
             
             if exit_reason:
-                print(f"\n� [{self.symbol}] EXIT TRIGGERED: {exit_reason}", flush=True)
+                print(f"\n🔔 [{self.symbol}] EXIT TRIGGERED: {exit_reason}", flush=True)
                 self._close_position(candle["close"], exit_reason)
         
-        # === ENTRY LOGIC (Triple-Confirmation) ===
+        # === ENTRY LOGIC (with MACD Lookback) ===
+        # MACD crossover triggers a "pending signal" that stays valid for N candles
+        # SuperTrend confirmation can come on crossover candle OR next N candles
         if self.position is None:
+            
+            # === Step 1: Track new MACD crossovers ===
+            if self.macd_bullish:
+                self.pending_macd_bullish = self.MACD_LOOKBACK_CANDLES + 1  # +1 for this candle
+                self.pending_macd_bearish = 0  # Cancel opposite signal
+                print(f"   ⚡ [{self.symbol}] MACD Bullish Cross detected (valid for {self.MACD_LOOKBACK_CANDLES} more candles)", flush=True)
+            
+            if self.macd_bearish:
+                self.pending_macd_bearish = self.MACD_LOOKBACK_CANDLES + 1
+                self.pending_macd_bullish = 0  # Cancel opposite signal
+                print(f"   ⚡ [{self.symbol}] MACD Bearish Cross detected (valid for {self.MACD_LOOKBACK_CANDLES} more candles)", flush=True)
+            
+            # === Step 2: Check for SuperTrend confirmation ===
+            st_bullish_flip = (self.current_trend == 1 and prev_trend == -1)
+            st_bearish_flip = (self.current_trend == -1 and prev_trend == 1)
+            st_bullish = (self.current_trend == 1)
+            st_bearish = (self.current_trend == -1)
+            
             buy_confirmed = False
             sell_confirmed = False
             
-            # BUY Signal: MACD bullish + SuperTrend bullish + Price below VWAP + PCR < 1.0
-            if self.macd_bullish and self.current_trend == 1:
+            # BUY: Pending MACD bullish + ST bullish + Below VWAP + PCR < 1.0
+            if self.pending_macd_bullish > 0 and st_bullish:
                 if candle['close'] < self.vwap:
                     if pcr < 1.0:
                         buy_confirmed = True
-                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION BUY!", flush=True)
-                        print(f"   MACD: ↑ Crossover | ST: Bullish | VWAP: Below | PCR: {pcr:.2f}", flush=True)
+                        confirmation_type = "FLIP" if st_bullish_flip else "ALIGN"
+                        print(f"\n✅ [{self.symbol}] QUAD-CONFIRMATION BUY!", flush=True)
+                        print(f"   MACD: ↑ (pending) | ST: Bullish ({confirmation_type}) | VWAP: Below | PCR: {pcr:.2f}", flush=True)
                     else:
-                        print(f"[DEBUG] [{self.symbol}] BUY blocked: PCR {pcr:.2f} > 1.0", flush=True)
+                        print(f"   ⏳ [{self.symbol}] BUY blocked: PCR {pcr:.2f} > 1.0", flush=True)
                 else:
-                    print(f"[DEBUG] [{self.symbol}] BUY blocked: Price above VWAP", flush=True)
+                    print(f"   ⏳ [{self.symbol}] BUY blocked: Price above VWAP", flush=True)
             
-            # SELL Signal: MACD bearish + SuperTrend bearish + Price above VWAP + PCR > 1.0
-            if self.macd_bearish and self.current_trend == -1:
+            # SELL: Pending MACD bearish + ST bearish + Above VWAP + PCR > 1.0
+            if self.pending_macd_bearish > 0 and st_bearish:
                 if candle['close'] > self.vwap:
                     if pcr > 1.0:
                         sell_confirmed = True
-                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION SELL!", flush=True)
-                        print(f"   MACD: ↓ Crossover | ST: Bearish | VWAP: Above | PCR: {pcr:.2f}", flush=True)
+                        confirmation_type = "FLIP" if st_bearish_flip else "ALIGN"
+                        print(f"\n✅ [{self.symbol}] QUAD-CONFIRMATION SELL!", flush=True)
+                        print(f"   MACD: ↓ (pending) | ST: Bearish ({confirmation_type}) | VWAP: Above | PCR: {pcr:.2f}", flush=True)
                     else:
-                        print(f"[DEBUG] [{self.symbol}] SELL blocked: PCR {pcr:.2f} < 1.0", flush=True)
+                        print(f"   ⏳ [{self.symbol}] SELL blocked: PCR {pcr:.2f} < 1.0", flush=True)
                 else:
-                    print(f"[DEBUG] [{self.symbol}] SELL blocked: Price below VWAP", flush=True)
+                    print(f"   ⏳ [{self.symbol}] SELL blocked: Price below VWAP", flush=True)
             
-            # Enter position
+            # === Step 3: Enter position ===
             if buy_confirmed:
                 self._enter_position("BUY", candle, prev_candle)
+                self.pending_macd_bullish = 0
             elif sell_confirmed:
                 self._enter_position("SELL", candle, prev_candle)
+                self.pending_macd_bearish = 0
+            
+            # === Step 4: Decrement pending counters ===
+            if self.pending_macd_bullish > 0:
+                self.pending_macd_bullish -= 1
+                if self.pending_macd_bullish == 0:
+                    print(f"   ⌛ [{self.symbol}] MACD Bullish signal expired (no ST confirmation)", flush=True)
+            
+            if self.pending_macd_bearish > 0:
+                self.pending_macd_bearish -= 1
+                if self.pending_macd_bearish == 0:
+                    print(f"   ⌛ [{self.symbol}] MACD Bearish signal expired (no ST confirmation)", flush=True)
+
     
     def _enter_position(self, signal: str, candle: Dict, prev_candle: Dict = None):
         """Enter a new position based on Triple-Confirmation signal."""

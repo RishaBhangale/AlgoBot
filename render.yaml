@@ -3,24 +3,29 @@ services:
     name: supertrend-bot
     runtime: docker
     dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
     envVars:
-      # Zerodha Kite Connect
+      # ===== Zerodha Kite Connect =====
+      - key: KITE_API_KEY
+        sync: false
+      - key: KITE_API_SECRET
+        sync: false
       - key: KITE_USER_ID
         sync: false
       - key: KITE_PASSWORD
         sync: false
       - key: KITE_TOTP_SECRET
         sync: false
-      - key: KITE_API_KEY
-        sync: false
-      - key: KITE_API_SECRET
-        sync: false
-      # Telegram
+
+      # ===== Telegram Notifications =====
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      # Angel One (PCR Data)
+
+      # ===== Angel One SmartAPI (PCR Data) =====
       - key: ANGEL_API_KEY
         sync: false
       - key: ANGEL_SECRET_KEY
@@ -31,3 +36,9 @@ services:
         sync: false
       - key: ANGEL_TOTP_SECRET
         sync: false
+
+      # ===== Bot Configuration =====
+      - key: TRADING_MODE
+        value: "INDEX" # INDEX or STOCK
+      - key: PAPER_TRADING
+        value: "true"
