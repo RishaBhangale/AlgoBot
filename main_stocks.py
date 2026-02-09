@@ -42,6 +42,15 @@ try:
 except ImportError:
     IST = None
 
+# Import Angel One PCR tracker
+try:
+    from angel_one import AngelOnePCR, get_pcr_tracker
+    ANGEL_ONE_AVAILABLE = True
+except ImportError:
+    ANGEL_ONE_AVAILABLE = False
+    AngelOnePCR = None
+    get_pcr_tracker = None
+
 
 # ============================================================
 # CONFIGURATION
@@ -409,10 +418,20 @@ class StockTrader:
         
         self.logger(f"[{self.symbol}] {candle['timestamp'].strftime('%H:%M')} | C:{candle['close']:.0f} | ST:{self.supertrend_value:.0f} | MACD:{macd_str} | VWAP{vwap_tag} | {trend_str}")
         
-        # Get PCR
-        pcr = 1.0
+        # Get PCR - Check if real PCR is available
+        pcr = None  # None means not available
+        pcr_available = False
         if self.pcr_tracker:
-            pcr = self.pcr_tracker.get_pcr(self.symbol)
+            try:
+                pcr_value = self.pcr_tracker.get_pcr(self.symbol)
+                # If PCR is exactly 1.0, it's likely the default (not real data)
+                if pcr_value != 1.0:
+                    pcr = pcr_value
+                    pcr_available = True
+            except Exception as e:
+                print(f"   ⚠️ [{self.symbol}] PCR fetch error: {e}", flush=True)
+                pcr = None
+        
         
         # === EXIT LOGIC ===
         if self.position:
@@ -459,29 +478,45 @@ class StockTrader:
             buy_confirmed = False
             sell_confirmed = False
             
-            # BUY: Pending MACD bullish + ST bullish + Below VWAP + PCR < 1.0
+            # BUY: Pending MACD bullish + ST bullish + Below VWAP + (PCR < 1.0 if available)
             if self.pending_macd_bullish > 0 and st_bullish:
                 if candle['close'] < self.vwap:
-                    if pcr < 1.0:
+                    # PCR check: Skip if not available (use Triple-Confirmation), require <1.0 if available
+                    if pcr is None:
+                        # PCR not available - use Triple-Confirmation
+                        buy_confirmed = True
+                        confirmation_type = "FLIP" if st_bullish_flip else "ALIGN"
+                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION BUY! (PCR unavailable)", flush=True)
+                        print(f"   MACD: ↑ (pending) | ST: Bullish ({confirmation_type}) | VWAP: Below | PCR: N/A", flush=True)
+                    elif pcr < 1.0:
+                        # PCR available and bullish - Quad-Confirmation
                         buy_confirmed = True
                         confirmation_type = "FLIP" if st_bullish_flip else "ALIGN"
                         print(f"\n✅ [{self.symbol}] QUAD-CONFIRMATION BUY!", flush=True)
                         print(f"   MACD: ↑ (pending) | ST: Bullish ({confirmation_type}) | VWAP: Below | PCR: {pcr:.2f}", flush=True)
                     else:
-                        print(f"   ⏳ [{self.symbol}] BUY blocked: PCR {pcr:.2f} > 1.0", flush=True)
+                        print(f"   ⏳ [{self.symbol}] BUY blocked: PCR {pcr:.2f} >= 1.0 (bearish)", flush=True)
                 else:
                     print(f"   ⏳ [{self.symbol}] BUY blocked: Price above VWAP", flush=True)
             
-            # SELL: Pending MACD bearish + ST bearish + Above VWAP + PCR > 1.0
+            # SELL: Pending MACD bearish + ST bearish + Above VWAP + (PCR > 1.0 if available)
             if self.pending_macd_bearish > 0 and st_bearish:
                 if candle['close'] > self.vwap:
-                    if pcr > 1.0:
+                    # PCR check: Skip if not available, require >1.0 if available
+                    if pcr is None:
+                        # PCR not available - use Triple-Confirmation
+                        sell_confirmed = True
+                        confirmation_type = "FLIP" if st_bearish_flip else "ALIGN"
+                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION SELL! (PCR unavailable)", flush=True)
+                        print(f"   MACD: ↓ (pending) | ST: Bearish ({confirmation_type}) | VWAP: Above | PCR: N/A", flush=True)
+                    elif pcr > 1.0:
+                        # PCR available and bearish - Quad-Confirmation
                         sell_confirmed = True
                         confirmation_type = "FLIP" if st_bearish_flip else "ALIGN"
                         print(f"\n✅ [{self.symbol}] QUAD-CONFIRMATION SELL!", flush=True)
                         print(f"   MACD: ↓ (pending) | ST: Bearish ({confirmation_type}) | VWAP: Above | PCR: {pcr:.2f}", flush=True)
                     else:
-                        print(f"   ⏳ [{self.symbol}] SELL blocked: PCR {pcr:.2f} < 1.0", flush=True)
+                        print(f"   ⏳ [{self.symbol}] SELL blocked: PCR {pcr:.2f} <= 1.0 (bullish)", flush=True)
                 else:
                     print(f"   ⏳ [{self.symbol}] SELL blocked: Price below VWAP", flush=True)
             
@@ -598,7 +633,21 @@ class StockOptionsBot:
         self.ticker: Optional[KiteTicker] = None
         
         self.telegram = TelegramNotifier() if TELEGRAM_AVAILABLE else None
-        self.pcr_tracker = StockPCRTracker()
+        
+        # Initialize PCR tracker - try Angel One, fallback to dummy
+        self.pcr_tracker = None
+        self.pcr_available = False
+        if ANGEL_ONE_AVAILABLE:
+            try:
+                self.pcr_tracker = get_pcr_tracker(self._log)
+                print("📊 Angel One PCR tracker initialized", flush=True)
+            except Exception as e:
+                print(f"⚠️ Angel One PCR init failed: {e}", flush=True)
+                self.pcr_tracker = StockPCRTracker()
+        else:
+            print("⚠️ Angel One not available, using fallback PCR", flush=True)
+            self.pcr_tracker = StockPCRTracker()
+        
         self.metrics = MetricsTracker()
         
         self.traders: Dict[str, StockTrader] = {}
