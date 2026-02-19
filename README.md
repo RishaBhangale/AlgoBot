@@ -81,8 +81,8 @@ supertrend-bot/
 
 ```bash
 # Clone repository
-git clone https://github.com/YOUR_USERNAME/supertrend-bot.git
-cd supertrend-bot
+git clone https://github.com/RishaBhangale/AlgoBot.git
+cd AlgoBot
 
 # Install dependencies
 pip install -r requirements.txt
@@ -101,8 +101,8 @@ python main_stocks.py
 ### Run with Docker
 
 ```bash
-docker build -t supertrend-bot .
-docker run -p 10000:10000 --env-file .env supertrend-bot
+docker build -t AlgoBot .
+docker run -p 10000:10000 --env-file .env AlgoBot
 ```
 
 ## ☁️ Render Deployment
