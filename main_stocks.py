@@ -305,16 +305,23 @@ class StockPCRTracker:
 # ============================================================
 class StockTrader:
     """
-    Quad-Confirmation Trading for one stock.
+    Scoring-Based Trading for one stock.
     
-    Entry Logic (with MACD lookback):
-    - MACD crossover triggers a "pending signal" that stays valid for 2 candles
-    - If SuperTrend confirms within those 2 candles → ENTRY
-    - VWAP and PCR must still be valid at the time of entry
+    Entry Logic (Scoring System + MACD lookback):
+    - MACD crossover triggers a "pending signal" valid for 3 candles
+    - Each indicator contributes a weighted score:
+        MACD pending:     +1.0
+        SuperTrend aligned: +1.0  (+0.5 bonus for FLIP)
+        VWAP confirmation:  +0.5  (price ABOVE for BUY, BELOW for SELL)
+        PCR confirmation:   +0.5  (skipped if unavailable)
+    - Entry when score >= 2.0 (max possible: 3.5)
     """
     
     # MACD signal lookback window (in candles)
-    MACD_LOOKBACK_CANDLES = 2
+    MACD_LOOKBACK_CANDLES = 3
+    
+    # Minimum score required to enter a position
+    ENTRY_SCORE_THRESHOLD = 2.0
     
     def __init__(self, symbol: str, config: Dict, logger, telegram=None, pcr_tracker=None, metrics=None):
         self.symbol = symbol
@@ -330,7 +337,7 @@ class StockTrader:
         
         # Indicators
         self.current_trend = 0
-        self.prev_trend = 0  # Track previous trend for SuperTrend flip detection
+        self.prev_trend = 0
         self.supertrend_value = 0
         self.current_atr = 0
         self.macd_line = 0
@@ -341,13 +348,15 @@ class StockTrader:
         self.vwap_is_real = False
         
         # MACD Signal Lookback Tracking
-        # When MACD crosses, we remember it for N candles
-        self.pending_macd_bullish = 0  # Countdown of candles remaining
-        self.pending_macd_bearish = 0  # Countdown of candles remaining
+        self.pending_macd_bullish = 0
+        self.pending_macd_bearish = 0
         
         self.position: Optional[Position] = None
         self.trades: List[Position] = []
         self.signals: List[Dict] = []
+        
+        # MFE tracking for blocked signals
+        self.blocked_signals: List[Dict] = []
         
         self.tick_count = 0
         self.candle_count = 0
@@ -450,94 +459,152 @@ class StockTrader:
             if exit_reason:
                 self._close_position(candle["close"], exit_reason)
         
-        # === ENTRY LOGIC (with MACD Lookback) ===
-        # MACD crossover triggers a "pending signal" that stays valid for N candles
-        # SuperTrend confirmation can come on crossover candle OR next N candles
+        # === ENTRY LOGIC (Scoring System + MACD Lookback) ===
         if self.position is None:
             
             # === Step 1: Track new MACD crossovers ===
             if self.macd_bullish:
-                self.pending_macd_bullish = self.MACD_LOOKBACK_CANDLES + 1  # +1 for this candle
-                self.pending_macd_bearish = 0  # Cancel opposite signal
-                print(f"   ⚡ [{self.symbol}] MACD Bullish Cross detected (valid for {self.MACD_LOOKBACK_CANDLES} more candles)", flush=True)
+                self.pending_macd_bullish = self.MACD_LOOKBACK_CANDLES + 1
+                self.pending_macd_bearish = 0
+                print(f"   ⚡ [{self.symbol}] MACD Bullish Cross (valid for {self.MACD_LOOKBACK_CANDLES} candles)", flush=True)
             
             if self.macd_bearish:
                 self.pending_macd_bearish = self.MACD_LOOKBACK_CANDLES + 1
-                self.pending_macd_bullish = 0  # Cancel opposite signal
-                print(f"   ⚡ [{self.symbol}] MACD Bearish Cross detected (valid for {self.MACD_LOOKBACK_CANDLES} more candles)", flush=True)
+                self.pending_macd_bullish = 0
+                print(f"   ⚡ [{self.symbol}] MACD Bearish Cross (valid for {self.MACD_LOOKBACK_CANDLES} candles)", flush=True)
             
-            # === Step 2: Check for SuperTrend confirmation ===
-            # SuperTrend flip: trend changed from previous candle
+            # === Step 2: Update MFE for previously blocked signals ===
+            for blocked in self.blocked_signals:
+                candles_since = blocked.get("candles_tracked", 0) + 1
+                if candles_since <= 5:
+                    if blocked["direction"] == "BUY":
+                        move = candle["close"] - blocked["price"]
+                    else:
+                        move = blocked["price"] - candle["close"]
+                    blocked["mfe"] = max(blocked.get("mfe", 0), move)
+                    blocked["candles_tracked"] = candles_since
+            # Clean up old MFE entries
+            self.blocked_signals = [b for b in self.blocked_signals if b.get("candles_tracked", 0) < 5]
+            
+            # === Step 3: Calculate entry score ===
             st_bullish_flip = (self.current_trend == 1 and prev_trend == -1)
             st_bearish_flip = (self.current_trend == -1 and prev_trend == 1)
-            
-            # OR: SuperTrend already in correct trend
             st_bullish = (self.current_trend == 1)
             st_bearish = (self.current_trend == -1)
             
-            buy_confirmed = False
-            sell_confirmed = False
-            
-            # BUY: Pending MACD bullish + ST bullish + Below VWAP + (PCR < 1.0 if available)
-            if self.pending_macd_bullish > 0 and st_bullish:
-                if candle['close'] < self.vwap:
-                    # PCR check: Skip if not available (use Triple-Confirmation), require <1.0 if available
-                    if pcr is None:
-                        # PCR not available - use Triple-Confirmation
-                        buy_confirmed = True
-                        confirmation_type = "FLIP" if st_bullish_flip else "ALIGN"
-                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION BUY! (PCR unavailable)", flush=True)
-                        print(f"   MACD: ↑ (pending) | ST: Bullish ({confirmation_type}) | VWAP: Below | PCR: N/A", flush=True)
-                    elif pcr < 1.0:
-                        # PCR available and bullish - Quad-Confirmation
-                        buy_confirmed = True
-                        confirmation_type = "FLIP" if st_bullish_flip else "ALIGN"
-                        print(f"\n✅ [{self.symbol}] QUAD-CONFIRMATION BUY!", flush=True)
-                        print(f"   MACD: ↑ (pending) | ST: Bullish ({confirmation_type}) | VWAP: Below | PCR: {pcr:.2f}", flush=True)
+            # ----- BUY SCORING -----
+            if self.pending_macd_bullish > 0:
+                buy_score = 0.0
+                buy_breakdown = []
+                
+                # MACD pending: +1.0
+                buy_score += 1.0
+                buy_breakdown.append("MACD:+1.0")
+                
+                # SuperTrend: +1.0 if aligned, +0.5 bonus for FLIP
+                if st_bullish:
+                    buy_score += 1.0
+                    if st_bullish_flip:
+                        buy_score += 0.5
+                        buy_breakdown.append("ST:+1.5(FLIP)")
                     else:
-                        print(f"   ⏳ [{self.symbol}] BUY blocked: PCR {pcr:.2f} >= 1.0 (bearish)", flush=True)
+                        buy_breakdown.append("ST:+1.0(ALIGN)")
                 else:
-                    print(f"   ⏳ [{self.symbol}] BUY blocked: Price above VWAP", flush=True)
-            
-            # SELL: Pending MACD bearish + ST bearish + Above VWAP + (PCR > 1.0 if available)
-            if self.pending_macd_bearish > 0 and st_bearish:
+                    buy_breakdown.append("ST:0")
+                
+                # VWAP: +0.5 if price ABOVE VWAP (strength confirmation)
                 if candle['close'] > self.vwap:
-                    # PCR check: Skip if not available, require >1.0 if available
-                    if pcr is None:
-                        # PCR not available - use Triple-Confirmation
-                        sell_confirmed = True
-                        confirmation_type = "FLIP" if st_bearish_flip else "ALIGN"
-                        print(f"\n✅ [{self.symbol}] TRIPLE-CONFIRMATION SELL! (PCR unavailable)", flush=True)
-                        print(f"   MACD: ↓ (pending) | ST: Bearish ({confirmation_type}) | VWAP: Above | PCR: N/A", flush=True)
-                    elif pcr > 1.0:
-                        # PCR available and bearish - Quad-Confirmation
-                        sell_confirmed = True
-                        confirmation_type = "FLIP" if st_bearish_flip else "ALIGN"
-                        print(f"\n✅ [{self.symbol}] QUAD-CONFIRMATION SELL!", flush=True)
-                        print(f"   MACD: ↓ (pending) | ST: Bearish ({confirmation_type}) | VWAP: Above | PCR: {pcr:.2f}", flush=True)
-                    else:
-                        print(f"   ⏳ [{self.symbol}] SELL blocked: PCR {pcr:.2f} <= 1.0 (bullish)", flush=True)
+                    buy_score += 0.5
+                    buy_breakdown.append("VWAP:+0.5(above)")
                 else:
-                    print(f"   ⏳ [{self.symbol}] SELL blocked: Price below VWAP", flush=True)
+                    buy_breakdown.append("VWAP:0(below)")
+                
+                # PCR: +0.5 if available and < 1.0 (bullish sentiment)
+                if pcr is not None:
+                    if pcr < 1.0:
+                        buy_score += 0.5
+                        buy_breakdown.append(f"PCR:+0.5({pcr:.2f})")
+                    else:
+                        buy_breakdown.append(f"PCR:0({pcr:.2f})")
+                else:
+                    buy_breakdown.append("PCR:N/A")
+                
+                # === Decision ===
+                if buy_score >= self.ENTRY_SCORE_THRESHOLD:
+                    print(f"\n✅ [{self.symbol}] BUY SIGNAL! Score: {buy_score:.1f}/{3.5:.1f}", flush=True)
+                    print(f"   {' | '.join(buy_breakdown)}", flush=True)
+                    self._enter_position("BUY", candle, prev)
+                    self.pending_macd_bullish = 0
+                elif buy_score >= 1.0:
+                    # Near-miss: log for MFE tracking
+                    print(f"   📊 [{self.symbol}] BUY score {buy_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(buy_breakdown)}", flush=True)
+                    self.blocked_signals.append({
+                        "direction": "BUY", "price": candle["close"],
+                        "score": buy_score, "time": candle["timestamp"],
+                        "breakdown": buy_breakdown, "mfe": 0, "candles_tracked": 0
+                    })
             
-            # === Step 3: Enter position if confirmed ===
-            if buy_confirmed:
-                self._enter_position("BUY", candle, prev)
-                self.pending_macd_bullish = 0  # Reset after entry
-            elif sell_confirmed:
-                self._enter_position("SELL", candle, prev)
-                self.pending_macd_bearish = 0  # Reset after entry
+            # ----- SELL SCORING -----
+            if self.pending_macd_bearish > 0 and self.position is None:
+                sell_score = 0.0
+                sell_breakdown = []
+                
+                # MACD pending: +1.0
+                sell_score += 1.0
+                sell_breakdown.append("MACD:+1.0")
+                
+                # SuperTrend: +1.0 if aligned, +0.5 bonus for FLIP
+                if st_bearish:
+                    sell_score += 1.0
+                    if st_bearish_flip:
+                        sell_score += 0.5
+                        sell_breakdown.append("ST:+1.5(FLIP)")
+                    else:
+                        sell_breakdown.append("ST:+1.0(ALIGN)")
+                else:
+                    sell_breakdown.append("ST:0")
+                
+                # VWAP: +0.5 if price BELOW VWAP (weakness confirmation)
+                if candle['close'] < self.vwap:
+                    sell_score += 0.5
+                    sell_breakdown.append("VWAP:+0.5(below)")
+                else:
+                    sell_breakdown.append("VWAP:0(above)")
+                
+                # PCR: +0.5 if available and > 1.0 (bearish sentiment)
+                if pcr is not None:
+                    if pcr > 1.0:
+                        sell_score += 0.5
+                        sell_breakdown.append(f"PCR:+0.5({pcr:.2f})")
+                    else:
+                        sell_breakdown.append(f"PCR:0({pcr:.2f})")
+                else:
+                    sell_breakdown.append("PCR:N/A")
+                
+                # === Decision ===
+                if sell_score >= self.ENTRY_SCORE_THRESHOLD:
+                    print(f"\n✅ [{self.symbol}] SELL SIGNAL! Score: {sell_score:.1f}/{3.5:.1f}", flush=True)
+                    print(f"   {' | '.join(sell_breakdown)}", flush=True)
+                    self._enter_position("SELL", candle, prev)
+                    self.pending_macd_bearish = 0
+                elif sell_score >= 1.0:
+                    print(f"   📊 [{self.symbol}] SELL score {sell_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(sell_breakdown)}", flush=True)
+                    self.blocked_signals.append({
+                        "direction": "SELL", "price": candle["close"],
+                        "score": sell_score, "time": candle["timestamp"],
+                        "breakdown": sell_breakdown, "mfe": 0, "candles_tracked": 0
+                    })
             
             # === Step 4: Decrement pending counters ===
             if self.pending_macd_bullish > 0:
                 self.pending_macd_bullish -= 1
                 if self.pending_macd_bullish == 0:
-                    print(f"   ⌛ [{self.symbol}] MACD Bullish signal expired (no ST confirmation)", flush=True)
+                    print(f"   ⌛ [{self.symbol}] MACD Bullish expired", flush=True)
             
             if self.pending_macd_bearish > 0:
                 self.pending_macd_bearish -= 1
                 if self.pending_macd_bearish == 0:
-                    print(f"   ⌛ [{self.symbol}] MACD Bearish signal expired (no ST confirmation)", flush=True)
+                    print(f"   ⌛ [{self.symbol}] MACD Bearish expired", flush=True)
     
     def _enter_position(self, signal: str, candle: Dict, prev_candle: Dict = None):
         spot = candle["close"]

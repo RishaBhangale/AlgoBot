@@ -1,6 +1,6 @@
-# Quad-Confirmation Trading Bot
+# Scoring-Based Trading Bot
 
-Automated paper trading bot for **NIFTY/BANKNIFTY** and **5 F&O Stocks** using the **Quad-Confirmation** strategy with Telegram notifications.
+Automated paper trading bot for **NIFTY/BANKNIFTY** and **5 F&O Stocks** using a **Scoring-Based** entry system with Telegram notifications.
 
 ## 🎯 Strategy
 
@@ -8,8 +8,8 @@ Automated paper trading bot for **NIFTY/BANKNIFTY** and **5 F&O Stocks** using t
 |-----------|-------|
 | **Indicators** | SuperTrend (20, 2) + MACD (12, 26, 9) + VWAP + PCR |
 | **Timeframe** | 15 minutes |
-| **MACD Lookback** | 2 candles (waits for SuperTrend confirmation) |
-| **Entry** | All 4 indicators must align |
+| **MACD Lookback** | 3 candles (waits for SuperTrend confirmation) |
+| **Entry** | Score ≥ 2.0 (MACD:1 + ST:1/1.5 + VWAP:0.5 + PCR:0.5) |
 | **Exit** | MACD reversal OR SuperTrend reversal |
 | **SL** | Previous candle low/high (dynamic) |
 | **Target** | None - hold till reversal |
@@ -31,25 +31,24 @@ Automated paper trading bot for **NIFTY/BANKNIFTY** and **5 F&O Stocks** using t
 | HDFCBANK | 550 | ₹25 |
 | ICICIBANK | 700 | ₹12.5 |
 
-## 🔄 Entry Logic (with MACD Lookback)
+## 🔄 Entry Logic (Scoring System)
+
+Each indicator contributes a weighted score:
+
+| Indicator | BUY Score | SELL Score |
+|-----------|-----------|------------|
+| MACD pending | +1.0 | +1.0 |
+| SuperTrend aligned | +1.0 | +1.0 |
+| SuperTrend FLIP bonus | +0.5 | +0.5 |
+| VWAP (above for BUY, below for SELL) | +0.5 | +0.5 |
+| PCR (< 1.0 for BUY, > 1.0 for SELL) | +0.5 | +0.5 |
+| **Threshold** | **≥ 2.0** | **≥ 2.0** |
 
 ```
-Candle 1: ⚡ MACD Bullish Cross (valid for 2 more candles)
-Candle 2: ST still bearish... waiting
-Candle 3: ✅ ST flips bullish + VWAP + PCR → QUAD-CONFIRMATION BUY!
+Candle 1: ⚡ MACD Bullish Cross (valid for 3 more candles)
+Candle 2: ST still bearish... score 1.0 (MACD only)
+Candle 3: ✅ ST flips bullish + VWAP above → Score 3.0 → BUY!
 ```
-
-### BUY (Long CE)
-- ✓ MACD crosses UP (or pending from last 2 candles)
-- ✓ SuperTrend = Bullish (FLIP or ALIGN)
-- ✓ Price < VWAP
-- ✓ PCR < 1.0
-
-### SELL (Long PE)
-- ✓ MACD crosses DOWN (or pending from last 2 candles)
-- ✓ SuperTrend = Bearish (FLIP or ALIGN)
-- ✓ Price > VWAP
-- ✓ PCR > 1.0
 
 ## 🚪 Exit Conditions
 
@@ -63,16 +62,17 @@ Candle 3: ✅ ST flips bullish + VWAP + PCR → QUAD-CONFIRMATION BUY!
 
 ```
 supertrend-bot/
-├── app.py               # FastAPI server + daily loop
-├── main.py              # Index options bot (NIFTY/BANKNIFTY)
-├── main_stocks.py       # Stock options bot (5 F&O stocks)
-├── angel_one.py         # PCR via Angel One SmartAPI
-├── auto_login.py        # Selenium auto-login (Kite)
-├── telegram_notifier.py # Telegram notifications
-├── Dockerfile           # Docker config with Chromium
-├── render.yaml          # Render deployment config
-├── requirements.txt     # Python dependencies
-└── .env.example         # Environment template
+├── app.py                  # FastAPI server + daily loop
+├── main.py                 # Index options bot (NIFTY/BANKNIFTY)
+├── main_stocks.py          # Stock options bot (5 F&O stocks)
+├── backtest_comparison.py  # Old vs New strategy comparison
+├── angel_one.py            # PCR via Angel One SmartAPI
+├── auto_login.py           # Selenium auto-login (Kite)
+├── telegram_notifier.py    # Telegram notifications
+├── Dockerfile              # Docker config with Chromium
+├── render.yaml             # Render deployment config
+├── requirements.txt        # Python dependencies
+└── .env.example            # Environment template
 ```
 
 ## 🏃 Quick Start
@@ -185,10 +185,10 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
 ## 📱 Telegram Alerts
 
 ```
-✅ [NIFTY] QUAD-CONFIRMATION BUY!
-   MACD: ↑ (pending) | ST: Bullish (FLIP) | VWAP: Below | PCR: 0.85
+✅ [RELIANCE] BUY SIGNAL! Score: 3.0/3.5
+   MACD:+1.0 | ST:+1.5(FLIP) | VWAP:+0.5(above) | PCR:N/A
 
-🔔 [NIFTY] EXIT TRIGGERED: MACD_REVERSAL
+🔔 [RELIANCE] EXIT TRIGGERED: ST_REVERSAL
    Entry: ₹245.00 → Exit: ₹278.50
    P&L: ₹1,675
 ```
