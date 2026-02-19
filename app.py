@@ -169,6 +169,11 @@ def run_single_trading_day(creds: dict) -> bool:
         bot_instance.kite = auto_login.kite
         bot_instance.is_running = True
         
+        # Fetch stock tokens FIRST (creates traders + maps tokens)
+        if hasattr(bot_instance, 'fetch_stock_tokens'):
+            add_log("📋 Fetching stock instrument tokens...")
+            bot_instance.fetch_stock_tokens()
+        
         # Telegram notification
         if bot_instance.telegram:
             bot_instance.telegram.notify_bot_start(list(SECURITIES.keys()))

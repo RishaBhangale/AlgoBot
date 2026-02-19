@@ -844,19 +844,37 @@ class StockOptionsBot:
         
         stats = self.metrics.get_stats()
         
+        securities_data = {}
         for symbol, trader in self.traders.items():
             pnl = sum(t.pnl for t in trader.trades)
             wins = len([t for t in trader.trades if t.pnl > 0])
             losses = len([t for t in trader.trades if t.pnl <= 0])
             print(f"{symbol}: {len(trader.trades)} trades | W:{wins} L:{losses} | P&L: ₹{pnl:,.2f}")
+            
+            securities_data[symbol] = {
+                "trades": len(trader.trades),
+                "pnl": pnl,
+                "wins": wins,
+                "losses": losses
+            }
+        
+        total_pnl = stats.get('total_pnl', 0)
         
         print(f"\n📈 COMBINED STATS:")
         print(f"   Total Trades: {stats.get('total_trades', 0)}")
         print(f"   Win Rate: {stats.get('win_rate', 0):.1f}%")
-        print(f"   Total P&L: ₹{stats.get('total_pnl', 0):,.2f}")
+        print(f"   Total P&L: ₹{total_pnl:,.2f}")
         print(f"   Max Drawdown: ₹{stats.get('max_drawdown', 0):,.2f}")
         print(f"   Max DD from Winners: ₹{stats.get('max_dd_from_winners', 0):,.2f}")
         print(f"{'='*60}\n")
+        
+        # Send Telegram daily summary
+        if self.telegram:
+            try:
+                self.telegram.notify_daily_summary(today, securities_data, total_pnl)
+                print("📱 Daily summary sent to Telegram", flush=True)
+            except Exception as e:
+                print(f"⚠️ Telegram summary failed: {e}", flush=True)
         
         # Save report
         report = {

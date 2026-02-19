@@ -99,17 +99,19 @@ class TelegramNotifier:
             print(f"Telegram error: {e}")
             return False
     
-    def notify_bot_start(self, securities: List[str]):
+    def notify_bot_start(self, securities: List[str], atr_period: int = 20, 
+                         atr_mult: float = 2.0, timeframe: int = 15):
         """Notify that bot has started."""
         message = f"""
-🚀 <b>SUPERTREND BOT STARTED</b>
+🚀 <b>QUAD-CONFIRMATION BOT STARTED</b>
 
 📅 Date: {now_ist().strftime("%Y-%m-%d")}
 ⏰ Time: {now_ist().strftime("%H:%M:%S")} IST
 📊 Securities: {", ".join(securities)}
 
-Strategy: Supertrend (ATR:10, Mult:3.0)
-Timeframe: 5 minutes
+Strategy: MACD + SuperTrend (ATR:{atr_period}, Mult:{atr_mult}) + VWAP + PCR
+Timeframe: {timeframe} minutes
+MACD Lookback: 2 candles
 
 <i>Waiting for market signals...</i>
 """
