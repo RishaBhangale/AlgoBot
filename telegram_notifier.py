@@ -111,7 +111,8 @@ class TelegramNotifier:
 
 Strategy: MACD(1.0) + SuperTrend(1.0/1.5) + VWAP(0.5) + PCR(0.5) ≥ 2.0
 SuperTrend: ATR:{atr_period}, Mult:{atr_mult}
-Timeframe: {timeframe}min | MACD Lookback: 3 candles
+Mixed Timeframe: 15min (RELIANCE, LT) / 30min (SBIN, ICICIBANK, AXISBANK)
+MACD Lookback: 3 (RELIANCE, ICICIBANK, SBIN) / 5 (AXISBANK, LT)
 
 <i>Waiting for market signals...</i>
 """
