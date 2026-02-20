@@ -74,24 +74,52 @@ MAX_CONCURRENT_POSITIONS = 3
 PER_STOCK_CAPITAL_LIMIT = 25000
 DAILY_LOSS_LIMIT = 15000
 
-# 3 F&O Stocks Configuration (TCS/INFY removed: 60-day backtest showed consistent losses)
+# 5 F&O Stocks — Mixed Timeframe (optimized via 60-day backtest)
+# Each stock has its own timeframe & MACD lookback based on backtest performance
 STOCKS = {
     "RELIANCE": {
         "name": "Reliance Industries",
         "lot_size": 250,
         "strike_gap": 20,
-        "instrument_token": None,  # Will be fetched dynamically
-    },
-    "HDFCBANK": {
-        "name": "HDFC Bank",
-        "lot_size": 550,
-        "strike_gap": 25,
+        "timeframe": 15,       # 15min candles (best: PF 3.16, +₹37K)
+        "interval": "15minute",
+        "macd_lookback": 3,
         "instrument_token": None,
     },
     "ICICIBANK": {
         "name": "ICICI Bank",
         "lot_size": 700,
         "strike_gap": 12.5,
+        "timeframe": 30,       # 30min candles (best: PF 2.18, +₹33K)
+        "interval": "30minute",
+        "macd_lookback": 3,
+        "instrument_token": None,
+    },
+    "SBIN": {
+        "name": "State Bank of India",
+        "lot_size": 750,
+        "strike_gap": 5,
+        "timeframe": 30,       # 30min candles (best: PF 10.59, +₹124K)
+        "interval": "30minute",
+        "macd_lookback": 3,
+        "instrument_token": None,
+    },
+    "AXISBANK": {
+        "name": "Axis Bank",
+        "lot_size": 625,
+        "strike_gap": 25,
+        "timeframe": 30,       # 30min candles (best: PF 2.74, +₹62K)
+        "interval": "30minute",
+        "macd_lookback": 5,
+        "instrument_token": None,
+    },
+    "LT": {
+        "name": "Larsen & Toubro",
+        "lot_size": 150,
+        "strike_gap": 25,
+        "timeframe": 15,       # 15min candles (best: PF 1.68, +₹28K)
+        "interval": "15minute",
+        "macd_lookback": 5,
         "instrument_token": None,
     },
 }
@@ -306,7 +334,7 @@ class StockTrader:
     """
     
     # MACD signal lookback window (in candles)
-    MACD_LOOKBACK_CANDLES = 3
+    MACD_LOOKBACK_CANDLES = 3  # default, overridden by config
     
     # Minimum score required to enter a position
     ENTRY_SCORE_THRESHOLD = 2.0
@@ -318,6 +346,10 @@ class StockTrader:
         self.telegram = telegram
         self.pcr_tracker = pcr_tracker
         self.metrics = metrics
+        
+        # Per-stock timeframe & lookback from config
+        self.timeframe_minutes = config.get('timeframe', TIMEFRAME_MINUTES)
+        self.MACD_LOOKBACK_CANDLES = config.get('macd_lookback', 3)
         
         self.candles: List[Dict] = []
         self.current_candle: Optional[Dict] = None
@@ -358,7 +390,7 @@ class StockTrader:
             if self.tick_count % 100 == 0:
                 print(f"[TICK] [{self.symbol}] #{self.tick_count} LTP: {ltp:.2f}", flush=True)
             
-            candle_minute = (tick_time.minute // TIMEFRAME_MINUTES) * TIMEFRAME_MINUTES
+            candle_minute = (tick_time.minute // self.timeframe_minutes) * self.timeframe_minutes
             candle_ts = tick_time.replace(minute=candle_minute, second=0, microsecond=0)
             
             if self.current_candle is None or candle_ts != self.last_candle_time:
@@ -807,11 +839,12 @@ class StockOptionsBot:
                 
                 print(f"📊 Fetching {symbol}...", flush=True)
                 
+                interval = config.get('interval', '15minute')
                 data = self.kite.historical_data(
                     instrument_token=config["instrument_token"],
                     from_date=from_date,
                     to_date=to_date,
-                    interval="15minute"
+                    interval=interval
                 )
                 
                 for candle in data[-50:]:

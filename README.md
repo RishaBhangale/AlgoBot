@@ -22,14 +22,16 @@ Automated paper trading bot for **NIFTY/BANKNIFTY** and **3 F&O Stocks** using a
 | NIFTY | 50 | 50 |
 | BANKNIFTY | 25 | 100 |
 
-### Mode 2: Stock Options (`main_stocks.py`)
-| Stock | Lot Size | Strike Gap | 60-Day Backtest |
-|-------|----------|------------|-----------------|
-| RELIANCE | 250 | ₹20 | +₹37,450 ✅ |
-| HDFCBANK | 550 | ₹25 | -₹468 ⚠️ |
-| ICICIBANK | 700 | ₹12.5 | +₹33,460 ✅ |
+### Mode 2: Stock Options (`main_stocks.py`) — Mixed Timeframe
+| Stock | Lot Size | Strike Gap | Timeframe | MACD LB |
+|-------|----------|------------|-----------|---------|
+| RELIANCE | 250 | ₹20 | 15min | 3 |
+| ICICIBANK | 700 | ₹12.5 | 30min | 3 |
+| SBIN | 750 | ₹5 | 30min | 3 |
+| AXISBANK | 625 | ₹25 | 30min | 5 |
+| LT | 150 | ₹25 | 15min | 5 |
 
-> TCS and INFY were removed after 60-day backtesting showed consistent losses.
+> Each stock runs on its optimal timeframe based on 60-day backtesting.
 
 ## 🔄 Entry Logic (Scoring System)
 
@@ -65,7 +67,6 @@ supertrend-bot/
 ├── app.py                  # FastAPI server + daily loop
 ├── main.py                 # Index options bot (NIFTY/BANKNIFTY)
 ├── main_stocks.py          # Stock options bot (5 F&O stocks)
-├── backtest_comparison.py  # Old vs New strategy comparison
 ├── angel_one.py            # PCR via Angel One SmartAPI
 ├── auto_login.py           # Selenium auto-login (Kite)
 ├── telegram_notifier.py    # Telegram notifications
@@ -201,7 +202,7 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
 | Per-Stock Capital | ₹25,000 |
 | Daily Loss Limit | ₹15,000 |
 | Position Sizing | 1 lot per signal |
-| Stocks Traded | 3 (RELIANCE, HDFCBANK, ICICIBANK) |
+| Stocks Traded | 5 (RELIANCE, ICICIBANK, SBIN, AXISBANK, LT) |
 
 ---
 
