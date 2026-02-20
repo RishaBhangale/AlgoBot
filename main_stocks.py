@@ -74,25 +74,13 @@ MAX_CONCURRENT_POSITIONS = 3
 PER_STOCK_CAPITAL_LIMIT = 25000
 DAILY_LOSS_LIMIT = 15000
 
-# 5 F&O Stocks Configuration
+# 3 F&O Stocks Configuration (TCS/INFY removed: 60-day backtest showed consistent losses)
 STOCKS = {
     "RELIANCE": {
         "name": "Reliance Industries",
         "lot_size": 250,
         "strike_gap": 20,
         "instrument_token": None,  # Will be fetched dynamically
-    },
-    "TCS": {
-        "name": "Tata Consultancy",
-        "lot_size": 175,
-        "strike_gap": 50,
-        "instrument_token": None,
-    },
-    "INFY": {
-        "name": "Infosys",
-        "lot_size": 400,
-        "strike_gap": 20,
-        "instrument_token": None,
     },
     "HDFCBANK": {
         "name": "HDFC Bank",

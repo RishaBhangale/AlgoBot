@@ -103,15 +103,15 @@ class TelegramNotifier:
                          atr_mult: float = 2.0, timeframe: int = 15):
         """Notify that bot has started."""
         message = f"""
-🚀 <b>QUAD-CONFIRMATION BOT STARTED</b>
+🚀 <b>SCORING-BASED BOT STARTED</b>
 
 📅 Date: {now_ist().strftime("%Y-%m-%d")}
 ⏰ Time: {now_ist().strftime("%H:%M:%S")} IST
 📊 Securities: {", ".join(securities)}
 
-Strategy: MACD + SuperTrend (ATR:{atr_period}, Mult:{atr_mult}) + VWAP + PCR
-Timeframe: {timeframe} minutes
-MACD Lookback: 2 candles
+Strategy: MACD(1.0) + SuperTrend(1.0/1.5) + VWAP(0.5) + PCR(0.5) ≥ 2.0
+SuperTrend: ATR:{atr_period}, Mult:{atr_mult}
+Timeframe: {timeframe}min | MACD Lookback: 3 candles
 
 <i>Waiting for market signals...</i>
 """

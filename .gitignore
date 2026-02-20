@@ -3,6 +3,9 @@
 .env.local
 api_key.txt
 *.key
+access_token.json
+*access_token*
+*_token.json
 
 # Python
 __pycache__/

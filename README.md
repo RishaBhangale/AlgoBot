@@ -1,6 +1,6 @@
 # Scoring-Based Trading Bot
 
-Automated paper trading bot for **NIFTY/BANKNIFTY** and **5 F&O Stocks** using a **Scoring-Based** entry system with Telegram notifications.
+Automated paper trading bot for **NIFTY/BANKNIFTY** and **3 F&O Stocks** using a **Scoring-Based** entry system with Telegram notifications.
 
 ## 🎯 Strategy
 
@@ -23,13 +23,13 @@ Automated paper trading bot for **NIFTY/BANKNIFTY** and **5 F&O Stocks** using a
 | BANKNIFTY | 25 | 100 |
 
 ### Mode 2: Stock Options (`main_stocks.py`)
-| Stock | Lot Size | Strike Gap |
-|-------|----------|------------|
-| RELIANCE | 250 | ₹20 |
-| TCS | 175 | ₹50 |
-| INFY | 400 | ₹20 |
-| HDFCBANK | 550 | ₹25 |
-| ICICIBANK | 700 | ₹12.5 |
+| Stock | Lot Size | Strike Gap | 60-Day Backtest |
+|-------|----------|------------|-----------------|
+| RELIANCE | 250 | ₹20 | +₹37,450 ✅ |
+| HDFCBANK | 550 | ₹25 | -₹468 ⚠️ |
+| ICICIBANK | 700 | ₹12.5 | +₹33,460 ✅ |
+
+> TCS and INFY were removed after 60-day backtesting showed consistent losses.
 
 ## 🔄 Entry Logic (Scoring System)
 
@@ -197,10 +197,11 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
 
 | Parameter | Value |
 |-----------|-------|
-| Max Concurrent Positions | 3 (stocks mode) |
+| Max Concurrent Positions | 3 |
 | Per-Stock Capital | ₹25,000 |
 | Daily Loss Limit | ₹15,000 |
 | Position Sizing | 1 lot per signal |
+| Stocks Traded | 3 (RELIANCE, HDFCBANK, ICICIBANK) |
 
 ---
 

@@ -48,8 +48,6 @@ MACD_SIGNAL = 9
 
 STOCKS = {
     "RELIANCE": {"lot_size": 250, "strike_gap": 20},
-    "TCS":      {"lot_size": 175, "strike_gap": 50},
-    "INFY":     {"lot_size": 400, "strike_gap": 20},
     "HDFCBANK": {"lot_size": 550, "strike_gap": 25},
     "ICICIBANK":{"lot_size": 700, "strike_gap": 12.5},
 }
@@ -241,53 +239,61 @@ class StrategyRunner:
                 # BUY scoring
                 if pending_macd_bullish > 0 and not entered:
                     score = 1.0  # MACD
+                    reasons = {"MACD": True, "ST": False, "ST_FLIP": False, "VWAP": False}
                     if st_bullish:
                         score += 1.5 if st_bullish_flip else 1.0
-                    if close > vwap:  # FLIPPED: above = strength
+                        reasons["ST"] = True
+                        reasons["ST_FLIP"] = st_bullish_flip
+                    if close > vwap:
                         score += 0.5
-                    # PCR not available in backtest, skipped (not penalized)
+                        reasons["VWAP"] = True
                     
                     if score >= self.entry_threshold:
                         position = BacktestTrade(symbol, "BUY", close, row['timestamp'], close, config['strike_gap'])
                         pending_macd_bullish = 0
                         entered = True
                     elif score >= 1.0:
-                        self._track_blocked("BUY", close, score, row['timestamp'], df, i)
+                        blocked_reason = "ST_MISSING" if not reasons["ST"] else "VWAP_MISSING"
+                        self._track_blocked("BUY", close, score, row['timestamp'], df, i, symbol, reasons, blocked_reason)
                 
                 # SELL scoring
                 if pending_macd_bearish > 0 and not entered:
                     score = 1.0  # MACD
+                    reasons = {"MACD": True, "ST": False, "ST_FLIP": False, "VWAP": False}
                     if st_bearish:
                         score += 1.5 if st_bearish_flip else 1.0
-                    if close < vwap:  # FLIPPED: below = weakness
+                        reasons["ST"] = True
+                        reasons["ST_FLIP"] = st_bearish_flip
+                    if close < vwap:
                         score += 0.5
+                        reasons["VWAP"] = True
                     
                     if score >= self.entry_threshold:
                         position = BacktestTrade(symbol, "SELL", close, row['timestamp'], close, config['strike_gap'])
                         pending_macd_bearish = 0
                         entered = True
                     elif score >= 1.0:
-                        self._track_blocked("SELL", close, score, row['timestamp'], df, i)
+                        blocked_reason = "ST_MISSING" if not reasons["ST"] else "VWAP_MISSING"
+                        self._track_blocked("SELL", close, score, row['timestamp'], df, i, symbol, reasons, blocked_reason)
             else:
                 # === OLD: AND-gate Quad-Confirmation ===
-                
-                # BUY: MACD + ST + VWAP below + (no PCR in backtest)
                 if pending_macd_bullish > 0 and st_bullish:
-                    if close < vwap:  # OLD: below VWAP for BUY
+                    if close < vwap:
                         position = BacktestTrade(symbol, "BUY", close, row['timestamp'], close, config['strike_gap'])
                         pending_macd_bullish = 0
                         entered = True
                     else:
-                        self._track_blocked("BUY", close, 0, row['timestamp'], df, i)
+                        self._track_blocked("BUY", close, 0, row['timestamp'], df, i, symbol, 
+                                           {"MACD": True, "ST": True, "VWAP": False}, "VWAP_WRONG_SIDE")
                 
-                # SELL: MACD + ST + VWAP above
                 if pending_macd_bearish > 0 and st_bearish and not entered:
-                    if close > vwap:  # OLD: above VWAP for SELL
+                    if close > vwap:
                         position = BacktestTrade(symbol, "SELL", close, row['timestamp'], close, config['strike_gap'])
                         pending_macd_bearish = 0
                         entered = True
                     else:
-                        self._track_blocked("SELL", close, 0, row['timestamp'], df, i)
+                        self._track_blocked("SELL", close, 0, row['timestamp'], df, i, symbol,
+                                           {"MACD": True, "ST": True, "VWAP": False}, "VWAP_WRONG_SIDE")
             
             # Decrement counters
             if pending_macd_bullish > 0:
@@ -304,9 +310,12 @@ class StrategyRunner:
         return trades
     
     def _track_blocked(self, direction: str, price: float, score: float, 
-                       time, df: pd.DataFrame, idx: int):
-        """Track MFE for blocked signals using the 5 candles after the signal."""
+                       time, df: pd.DataFrame, idx: int, symbol: str = "",
+                       reasons: Dict = None, blocked_reason: str = ""):
+        """Track MFE and simulate what-if for blocked signals."""
+        # MFE over next 5 candles
         mfe = 0.0
+        mae = 0.0  # Max Adverse Excursion (worst drawdown)
         for j in range(1, min(6, len(df) - idx)):
             future_close = df.iloc[idx + j]['close']
             if direction == "BUY":
@@ -314,13 +323,48 @@ class StrategyRunner:
             else:
                 move = price - future_close
             mfe = max(mfe, move)
+            mae = min(mae, move)
+        
+        # Simulate what-if: take this trade and exit at next ST reversal or EOD
+        whatif_pnl = 0.0
+        whatif_exit_reason = "NO_EXIT"
+        for j in range(1, min(50, len(df) - idx)):  # Look up to 50 candles ahead
+            future_row = df.iloc[idx + j]
+            future_trend = future_row['trend']
+            future_prev = future_row['prev_trend']
+            
+            # ST reversal exit
+            if direction == "BUY" and future_trend == -1 and future_prev == 1:
+                whatif_pnl = future_row['close'] - price
+                whatif_exit_reason = "ST_REVERSAL"
+                break
+            elif direction == "SELL" and future_trend == 1 and future_prev == -1:
+                whatif_pnl = price - future_row['close']
+                whatif_exit_reason = "ST_REVERSAL"
+                break
+            
+            # EOD exit
+            ts = future_row['timestamp']
+            if hasattr(ts, 'hour') and ts.hour >= 15 and ts.minute >= 15:
+                if direction == "BUY":
+                    whatif_pnl = future_row['close'] - price
+                else:
+                    whatif_pnl = price - future_row['close']
+                whatif_exit_reason = "EOD"
+                break
         
         self.blocked_signals.append({
+            "symbol": symbol,
             "direction": direction,
-            "price": price,
+            "price": round(price, 2),
             "score": score,
             "time": str(time),
-            "mfe_5_candles": round(mfe, 2)
+            "mfe_5_candles": round(mfe, 2),
+            "mae_5_candles": round(mae, 2),
+            "whatif_pnl": round(whatif_pnl, 2),
+            "whatif_exit": whatif_exit_reason,
+            "blocked_reason": blocked_reason,
+            "reasons": reasons or {},
         })
     
     def get_stats(self) -> Dict:
@@ -374,71 +418,6 @@ class StrategyRunner:
 # ============================================================
 # DATA LOADING
 # ============================================================
-def load_data_from_kite(symbol: str, days: int = 15) -> Optional[pd.DataFrame]:
-    """
-    Load real historical data from Kite Connect.
-    Falls back to fewer days if data not available.
-    Returns None if Kite is not available.
-    """
-    try:
-        from kiteconnect import KiteConnect
-        from auto_login import KiteAutoLogin, load_credentials
-    except ImportError:
-        return None
-    
-    try:
-        creds = load_credentials()
-        auto_login = KiteAutoLogin(
-            api_key=creds["api_key"],
-            api_secret=creds["api_secret"],
-            user_id=creds["user_id"],
-            password=creds["password"],
-            totp_secret=creds["totp_secret"],
-            headless=True
-        )
-        access_token = auto_login.login()
-        if not access_token:
-            return None
-        
-        kite = auto_login.kite
-        
-        # Get instrument token
-        instruments = kite.instruments("NSE")
-        token = None
-        for inst in instruments:
-            if inst['tradingsymbol'] == symbol:
-                token = inst['instrument_token']
-                break
-        
-        if not token:
-            print(f"  ⚠️ Token not found for {symbol}")
-            return None
-        
-        to_date = datetime.now(IST) if IST else datetime.now()
-        from_date = to_date - timedelta(days=days)
-        
-        data = kite.historical_data(
-            instrument_token=token,
-            from_date=from_date,
-            to_date=to_date,
-            interval="15minute"
-        )
-        
-        if not data:
-            return None
-        
-        df = pd.DataFrame(data)
-        df.rename(columns={"date": "timestamp"}, inplace=True)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        
-        print(f"  ✅ {symbol}: {len(df)} candles ({days} days)")
-        return df
-        
-    except Exception as e:
-        print(f"  ❌ Failed to load {symbol}: {e}")
-        return None
-
-
 def load_data_from_cache(symbol: str) -> Optional[pd.DataFrame]:
     """Load data from cached CSV if available."""
     cache_path = LOG_DIR / f"backtest_data_{symbol}.csv"
@@ -454,6 +433,96 @@ def save_data_to_cache(df: pd.DataFrame, symbol: str):
     """Cache data for offline re-runs."""
     cache_path = LOG_DIR / f"backtest_data_{symbol}.csv"
     df.to_csv(cache_path, index=False)
+
+
+def load_all_stocks_from_kite(symbols: List[str], days: int = 15) -> Dict[str, pd.DataFrame]:
+    """
+    Authenticate ONCE then fetch all stocks in a single session.
+    Returns dict of symbol -> DataFrame.
+    """
+    # Load .env file for local runs
+    env_path = BASE_DIR / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    
+    try:
+        from kiteconnect import KiteConnect
+        from auto_login import KiteAutoLogin, load_credentials
+    except ImportError:
+        print("  ❌ kiteconnect or auto_login not available")
+        return {}
+    
+    try:
+        creds = load_credentials()
+        auto_login = KiteAutoLogin(
+            api_key=creds["api_key"],
+            api_secret=creds["api_secret"],
+            user_id=creds["user_id"],
+            password=creds["password"],
+            totp_secret=creds["totp_secret"],
+            headless=True
+        )
+        access_token = auto_login.login()
+        if not access_token:
+            print("  ❌ Login failed")
+            return {}
+        
+        kite = auto_login.kite
+        print("  ✅ Authenticated successfully")
+        
+        # Get all instrument tokens at once
+        instruments = kite.instruments("NSE")
+        token_map = {}
+        for inst in instruments:
+            if inst['tradingsymbol'] in symbols:
+                token_map[inst['tradingsymbol']] = inst['instrument_token']
+        
+        print(f"  📋 Found tokens for: {list(token_map.keys())}")
+        
+        # Fetch data for each stock
+        results = {}
+        to_date = datetime.now(IST) if IST else datetime.now()
+        from_date = to_date - timedelta(days=days)
+        
+        for symbol in symbols:
+            if symbol not in token_map:
+                print(f"  ⚠️ {symbol}: No instrument token found")
+                continue
+            
+            try:
+                import time as _time
+                _time.sleep(0.5)  # Rate limit: don't hammer Kite API
+                
+                data = kite.historical_data(
+                    instrument_token=token_map[symbol],
+                    from_date=from_date,
+                    to_date=to_date,
+                    interval="15minute"
+                )
+                
+                if data:
+                    df = pd.DataFrame(data)
+                    df.rename(columns={"date": "timestamp"}, inplace=True)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    results[symbol] = df
+                    save_data_to_cache(df, symbol)
+                    print(f"  ✅ {symbol}: {len(df)} candles ({days} days)")
+                else:
+                    print(f"  ⚠️ {symbol}: No data returned")
+            except Exception as e:
+                print(f"  ❌ {symbol}: {e}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"  ❌ Auth failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
 
 
 # ============================================================
@@ -483,29 +552,33 @@ def run_backtest():
         entry_threshold=2.0
     )
     
-    # Load data for each stock
+    # Load data: try cache first, then Kite (single login)
     print(f"\n📥 Loading real market data...")
     
     all_data = {}
-    days = 15  # Start with 15 trading days
+    symbols_needed = []
+    days = 60  # Kite max for intraday is 60 days
     
     for symbol in STOCKS:
-        # Try cache first, then Kite
         df = load_data_from_cache(symbol)
-        if df is None:
-            df = load_data_from_kite(symbol, days=days)
-            if df is not None:
-                save_data_to_cache(df, symbol)
-        
         if df is not None and len(df) >= ATR_PERIOD + 10:
             all_data[symbol] = df
         else:
-            print(f"  ⚠️ {symbol}: Insufficient data, skipping")
+            symbols_needed.append(symbol)
+    
+    # Fetch missing stocks from Kite (single authentication)
+    if symbols_needed:
+        print(f"\n🔐 Fetching {len(symbols_needed)} stocks from Kite (single login)...")
+        kite_data = load_all_stocks_from_kite(symbols_needed, days=days)
+        for symbol, df in kite_data.items():
+            if len(df) >= ATR_PERIOD + 10:
+                all_data[symbol] = df
+            else:
+                print(f"  ⚠️ {symbol}: Only {len(df)} candles, need {ATR_PERIOD + 10}+")
     
     if not all_data:
-        print("\n❌ No data available. Please run during market hours to cache data,")
-        print("   or ensure Kite credentials are configured.")
-        print("   Cached data will be saved to logs/backtest_data_*.csv")
+        print("\n❌ No data available. Ensure Kite credentials are in .env")
+        print("   and run during market hours to cache data.")
         sys.exit(1)
     
     # Run both strategies on each stock
@@ -602,25 +675,130 @@ def run_backtest():
         print(f"{symbol:<12} {data['old_trades']:<12} {data['new_trades']:<12} "
               f"₹{data['old_pnl']:<13,.2f} ₹{data['new_pnl']:<13,.2f}")
     
-    # MFE Analysis
+    # ================================================================
+    # DEEP BLOCKED SIGNAL ANALYSIS (NEW strategy)
+    # ================================================================
     print(f"\n{'=' * 70}")
-    print(f"📐 MFE ANALYSIS (Blocked Signals)")
+    print(f"🔍 DEEP BLOCKED SIGNAL ANALYSIS (NEW Strategy)")
     print(f"{'=' * 70}")
     
-    for strategy_name, strategy in [("OLD", old_strategy), ("NEW", new_strategy)]:
-        blocked = strategy.blocked_signals
+    blocked = new_strategy.blocked_signals
+    if blocked:
+        # --- 1. WHY were signals blocked? ---
+        print(f"\n  📋 BLOCK REASONS:")
+        reason_counts = {}
+        for b in blocked:
+            r = b.get('blocked_reason', 'UNKNOWN')
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+        
+        for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            pct = count / len(blocked) * 100
+            print(f"    {reason}: {count} ({pct:.0f}%)")
+        
+        # --- 2. WHAT-IF: What if we took all blocked signals? ---
+        print(f"\n  💰 WHAT-IF ANALYSIS (if all {len(blocked)} blocked signals were taken):")
+        whatif_pnls = [b['whatif_pnl'] for b in blocked]
+        whatif_winners = [b for b in blocked if b['whatif_pnl'] > 0]
+        whatif_losers = [b for b in blocked if b['whatif_pnl'] <= 0]
+        whatif_total = sum(whatif_pnls)
+        
+        print(f"    Total what-if P&L: ₹{whatif_total:.2f} (per share)")
+        print(f"    Winners: {len(whatif_winners)} | Losers: {len(whatif_losers)}")
         if blocked:
-            mfe_values = [b['mfe_5_candles'] for b in blocked]
-            profitable_blocks = [b for b in blocked if b['mfe_5_candles'] > 0]
-            print(f"\n  {strategy_name}:")
-            print(f"    Blocked signals: {len(blocked)}")
-            print(f"    Would have been profitable: {len(profitable_blocks)} ({len(profitable_blocks)/len(blocked)*100:.0f}%)")
-            print(f"    Avg MFE (5 candles): ₹{np.mean(mfe_values):.2f}")
-            print(f"    Max MFE (5 candles): ₹{np.max(mfe_values):.2f}")
-            if profitable_blocks:
-                print(f"    Avg profitable MFE:  ₹{np.mean([b['mfe_5_candles'] for b in profitable_blocks]):.2f}")
-        else:
-            print(f"\n  {strategy_name}: No blocked signals")
+            print(f"    Win rate: {len(whatif_winners)/len(blocked)*100:.0f}%")
+        if whatif_winners:
+            print(f"    Avg winner: ₹{np.mean([b['whatif_pnl'] for b in whatif_winners]):.2f}")
+        if whatif_losers:
+            print(f"    Avg loser: ₹{np.mean([b['whatif_pnl'] for b in whatif_losers]):.2f}")
+        
+        # --- 3. Breakdown by block reason ---
+        print(f"\n  📊 WHAT-IF BY BLOCK REASON:")
+        print(f"    {'Reason':<16} {'Count':<8} {'WinRate':<10} {'Avg P&L':<12} {'Total P&L':<12} {'Verdict'}")
+        print(f"    {'-'*16} {'-'*8} {'-'*10} {'-'*12} {'-'*12} {'-'*10}")
+        
+        for reason in reason_counts:
+            reason_signals = [b for b in blocked if b.get('blocked_reason') == reason]
+            reason_pnls = [b['whatif_pnl'] for b in reason_signals]
+            reason_winners = [p for p in reason_pnls if p > 0]
+            reason_wr = len(reason_winners) / len(reason_signals) * 100 if reason_signals else 0
+            reason_avg = np.mean(reason_pnls) if reason_pnls else 0
+            reason_total = sum(reason_pnls)
+            
+            verdict = "🟢 LOWER threshold" if reason_wr > 55 and reason_avg > 0 else "🔴 KEEP blocking"
+            print(f"    {reason:<16} {len(reason_signals):<8} {reason_wr:<10.0f}% ₹{reason_avg:<11.2f} ₹{reason_total:<11.2f} {verdict}")
+        
+        # --- 4. Per-stock blocked analysis ---
+        print(f"\n  📈 BLOCKED PER STOCK:")
+        print(f"    {'Stock':<12} {'Blocked':<10} {'WhatIf P&L':<14} {'Avg MFE':<12}")
+        print(f"    {'-'*12} {'-'*10} {'-'*14} {'-'*12}")
+        
+        stock_blocked = {}
+        for b in blocked:
+            sym = b.get('symbol', '?')
+            if sym not in stock_blocked:
+                stock_blocked[sym] = []
+            stock_blocked[sym].append(b)
+        
+        for sym, sigs in sorted(stock_blocked.items()):
+            total_whatif = sum(b['whatif_pnl'] for b in sigs)
+            avg_mfe = np.mean([b['mfe_5_candles'] for b in sigs])
+            lot_size = STOCKS.get(sym, {}).get('lot_size', 1)
+            print(f"    {sym:<12} {len(sigs):<10} ₹{total_whatif:<13.2f} ₹{avg_mfe:<11.2f}")
+        
+        # --- 5. Top missed opportunities ---
+        print(f"\n  🎯 TOP 10 MISSED OPPORTUNITIES (highest what-if P&L):")
+        sorted_blocked = sorted(blocked, key=lambda b: b['whatif_pnl'], reverse=True)
+        for i, b in enumerate(sorted_blocked[:10]):
+            print(f"    {i+1}. [{b.get('symbol','?')}] {b['direction']} @ ₹{b['price']:.0f} "
+                  f"| Score: {b['score']:.1f} | What-if: ₹{b['whatif_pnl']:+.2f} "
+                  f"| Exit: {b.get('whatif_exit','?')} | Reason: {b.get('blocked_reason','?')} "
+                  f"| {b['time'][:16]}")
+        
+        # --- 6. Optimization recommendations ---
+        print(f"\n{'=' * 70}")
+        print(f"💡 OPTIMIZATION RECOMMENDATIONS")
+        print(f"{'=' * 70}")
+        
+        st_missing = [b for b in blocked if b.get('blocked_reason') == 'ST_MISSING']
+        vwap_missing = [b for b in blocked if b.get('blocked_reason') == 'VWAP_MISSING']
+        
+        if st_missing:
+            st_whatif = sum(b['whatif_pnl'] for b in st_missing)
+            st_wr = len([b for b in st_missing if b['whatif_pnl'] > 0]) / len(st_missing) * 100
+            print(f"\n  1️⃣  ST_MISSING: {len(st_missing)} signals blocked because SuperTrend wasn't aligned")
+            print(f"     What-if win rate: {st_wr:.0f}% | What-if total P&L: ₹{st_whatif:.2f}")
+            if st_wr < 45:
+                print(f"     → ✅ CORRECT to block. These have low win rate, ST confirmation adds value.")
+            else:
+                print(f"     → ⚠️ Consider lowering threshold to 1.5 for MACD+VWAP signals")
+        
+        if vwap_missing:
+            vwap_whatif = sum(b['whatif_pnl'] for b in vwap_missing)
+            vwap_wr = len([b for b in vwap_missing if b['whatif_pnl'] > 0]) / len(vwap_missing) * 100
+            print(f"\n  2️⃣  VWAP_MISSING: {len(vwap_missing)} signals blocked because VWAP wasn't aligned")
+            print(f"     These have MACD+ST confirmed (score 2.0) but VWAP on wrong side")
+            print(f"     What-if win rate: {vwap_wr:.0f}% | What-if total P&L: ₹{vwap_whatif:.2f}")
+            if vwap_wr > 50 and vwap_whatif > 0:
+                print(f"     → ⚠️ VWAP may be hurting! These signals would have been profitable.")
+                print(f"     → Consider: MACD+ST alone (score 2.0) is enough to enter.")
+            else:
+                print(f"     → ✅ VWAP filter is correctly blocking losing trades.")
+    else:
+        print(f"\n  No blocked signals to analyze.")
+    
+    # ================================================================
+    # OLD strategy blocked analysis (brief)
+    # ================================================================
+    print(f"\n{'=' * 70}")
+    print(f"📐 OLD STRATEGY BLOCKED SIGNALS (brief)")
+    print(f"{'=' * 70}")
+    old_blocked = old_strategy.blocked_signals
+    if old_blocked:
+        old_whatif_total = sum(b['whatif_pnl'] for b in old_blocked)
+        old_whatif_winners = len([b for b in old_blocked if b['whatif_pnl'] > 0])
+        print(f"  Blocked: {len(old_blocked)} | What-if winners: {old_whatif_winners} ({old_whatif_winners/len(old_blocked)*100:.0f}%)")
+        print(f"  What-if total P&L: ₹{old_whatif_total:.2f} (per share)")
+        print(f"  → OLD strategy was blocking {old_whatif_winners} profitable trades")
     
     # Save results
     results = {
@@ -630,12 +808,18 @@ def run_backtest():
         "old_strategy": old_stats,
         "new_strategy": new_stats,
         "per_stock": per_stock_results,
-        "mfe_analysis": {
-            "old_blocked": len(old_strategy.blocked_signals),
-            "new_blocked": len(new_strategy.blocked_signals),
-            "old_avg_mfe": round(np.mean([b['mfe_5_candles'] for b in old_strategy.blocked_signals]), 2) if old_strategy.blocked_signals else 0,
-            "new_avg_mfe": round(np.mean([b['mfe_5_candles'] for b in new_strategy.blocked_signals]), 2) if new_strategy.blocked_signals else 0,
-        }
+        "blocked_analysis": {
+            "new_blocked": len(blocked),
+            "reason_breakdown": reason_counts if blocked else {},
+            "whatif_total_pnl": round(sum(b['whatif_pnl'] for b in blocked), 2) if blocked else 0,
+            "whatif_winners": len([b for b in blocked if b['whatif_pnl'] > 0]) if blocked else 0,
+        },
+        "blocked_signals_detail": [{
+            "symbol": b.get('symbol'), "direction": b['direction'], 
+            "score": b['score'], "blocked_reason": b.get('blocked_reason'),
+            "whatif_pnl": b['whatif_pnl'], "mfe": b['mfe_5_candles'],
+            "time": b['time']
+        } for b in blocked] if blocked else []
     }
     
     results_path = LOG_DIR / f"backtest_results_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
@@ -643,9 +827,9 @@ def run_backtest():
         json.dump(results, f, indent=2, default=str)
     
     print(f"\n💾 Results saved to: {results_path}")
-    print(f"\n{'=' * 70}")
+    print(f"{'=' * 70}")
     
-    # Verdict
+    # Final verdict
     print(f"\n🏆 VERDICT:")
     if new_stats['total_trades'] > old_stats['total_trades']:
         print(f"  ✅ NEW generates {new_stats['total_trades'] - old_stats['total_trades']} more trades")
@@ -653,11 +837,14 @@ def run_backtest():
         print(f"  ✅ NEW has higher win rate ({new_stats['win_rate']}% vs {old_stats['win_rate']}%)")
     if new_stats['profit_factor'] > old_stats['profit_factor']:
         print(f"  ✅ NEW has better profit factor ({new_stats['profit_factor']} vs {old_stats['profit_factor']})")
-    if old_strategy.blocked_signals:
-        profitable_blocks = [b for b in old_strategy.blocked_signals if b['mfe_5_candles'] > 0]
-        if len(profitable_blocks) > len(old_strategy.blocked_signals) * 0.5:
-            print(f"  ⚠️  OLD blocked {len(profitable_blocks)} signals that would have been profitable")
     
+    # Lot-size-adjusted P&L
+    print(f"\n  💰 LOT-SIZE-ADJUSTED P&L:")
+    for symbol, data in per_stock_results.items():
+        lot = STOCKS[symbol]['lot_size']
+        print(f"    {symbol}: ₹{data['new_pnl']:.2f}/share × {lot} lots = ₹{data['new_pnl'] * lot:,.0f}")
+    total_adj = sum(data['new_pnl'] * STOCKS[sym]['lot_size'] for sym, data in per_stock_results.items())
+    print(f"    TOTAL: ₹{total_adj:,.0f}")
     print()
 
 
