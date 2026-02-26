@@ -25,7 +25,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 # ============================================================
 # TRADING MODE TOGGLE
 # ============================================================
-TRADING_MODE = os.environ.get("TRADING_MODE", "INDEX").upper()
+TRADING_MODE = os.environ.get("TRADING_MODE", "STOCK").upper()
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 
 print(f"🎯 TRADING_MODE: {TRADING_MODE}", flush=True)

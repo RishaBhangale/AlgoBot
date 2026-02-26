@@ -39,6 +39,6 @@ services:
 
       # ===== Bot Configuration =====
       - key: TRADING_MODE
-        value: "INDEX" # INDEX or STOCK
+        value: "STOCK" # INDEX or STOCK
       - key: PAPER_TRADING
         value: "true"
