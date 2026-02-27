@@ -171,8 +171,11 @@ def run_single_trading_day(creds: dict) -> bool:
         
         # Fetch stock tokens FIRST (creates traders + maps tokens)
         if hasattr(bot_instance, 'fetch_stock_tokens'):
-            add_log("📋 Fetching stock instrument tokens...")
-            bot_instance.fetch_stock_tokens()
+            success = bot_instance.fetch_stock_tokens()
+            if not success:
+                add_log("❌ Failed to fetch tokens. Aborting today's session.")
+                bot_status["status"] = "error"
+                return False
         
         # Telegram notification
         if bot_instance.telegram:

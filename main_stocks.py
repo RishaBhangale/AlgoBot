@@ -796,34 +796,53 @@ class StockOptionsBot:
             self._log(f"❌ Auth failed: {e}")
             return False
     
-    def fetch_stock_tokens(self):
+    def fetch_stock_tokens(self) -> bool:
         """Fetch instrument tokens for all stocks."""
-        print("\n📋 Fetching stock tokens...")
+        self._log("📋 Fetching stock tokens...")
         
+        # Check if all tokens are already cached from yesterday
+        all_cached = all(config.get('instrument_token') is not None for config in STOCKS.values())
+        
+        if not all_cached:
+            import time
+            success = False
+            for attempt in range(3):
+                try:
+                    self._log(f"   Downloading instruments CSV (Attempt {attempt+1}/3)...")
+                    instruments = self.kite.instruments("NSE")
+                    for symbol in STOCKS.keys():
+                        for inst in instruments:
+                            if inst['tradingsymbol'] == symbol:
+                                STOCKS[symbol]['instrument_token'] = inst['instrument_token']
+                                break
+                    success = True
+                    break
+                except Exception as e:
+                    self._log(f"   ⚠️ API Error fetching instruments: {e}")
+                    time.sleep(2)
+            
+            if not success:
+                self._log("❌ FATAL: Could not fetch instrument tokens after retries.")
+                return False
+        else:
+            self._log("   ✓ Using cached instrument tokens from memory.")
+        
+        # Initialize token_to_symbol map and traders
         try:
-            instruments = self.kite.instruments("NSE")
-            
-            for symbol in STOCKS.keys():
-                for inst in instruments:
-                    if inst['tradingsymbol'] == symbol:
-                        STOCKS[symbol]['instrument_token'] = inst['instrument_token']
-                        self.token_to_symbol[inst['instrument_token']] = symbol
-                        print(f"   ✓ {symbol}: {inst['instrument_token']}")
-                        break
-            
-            # Initialize traders
             for symbol, config in STOCKS.items():
                 if config['instrument_token']:
+                    self.token_to_symbol[config['instrument_token']] = symbol
+                    
                     self.traders[symbol] = StockTrader(
                         symbol, config, self._log, self.telegram, 
                         self.pcr_tracker, self.metrics
                     )
             
-            print(f"   ✅ {len(self.traders)} stocks ready")
-            return True
+            self._log(f"   ✅ {len(self.traders)} stocks initialized and ready.")
+            return len(self.traders) > 0
             
         except Exception as e:
-            print(f"   ❌ Error: {e}")
+            self._log(f"   ❌ Error initializing traders: {e}")
             return False
     
     def fetch_historical(self):
