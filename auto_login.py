@@ -126,6 +126,7 @@ class KiteAutoLogin:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         
@@ -189,10 +190,18 @@ class KiteAutoLogin:
             self.driver.get(login_url)
             log(f"📍 Navigated to login page")
             
-            # Wait for login form
-            WebDriverWait(self.driver, 15).until(
-                EC.presence_of_element_located((By.ID, "userid"))
-            )
+            # Wait for login form (with diagnostic details on failure)
+            try:
+                WebDriverWait(self.driver, 25).until(
+                    EC.presence_of_element_located((By.ID, "userid"))
+                )
+            except TimeoutException as te:
+                log(f"❌ Timeout waiting for #userid element!")
+                log(f"   Current URL: {self.driver.current_url}")
+                log(f"   Page Title: {self.driver.title}")
+                snippet = self.driver.page_source[:300].replace('\n', ' ') if self.driver.page_source else 'Empty'
+                log(f"   Page Snippet: {snippet}")
+                raise te
             
             # Enter user ID
             userid_input = self.driver.find_element(By.ID, "userid")
