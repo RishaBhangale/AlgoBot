@@ -1,211 +1,121 @@
-# Scoring-Based Trading Bot
+# 🚀 Quad-Confirmation + Alligator Golden Zone Stock Trading Engine
 
-Automated paper trading bot for **NIFTY/BANKNIFTY** and **3 F&O Stocks** using a **Scoring-Based** entry system with Telegram notifications.
-
-## 🎯 Strategy
-
-| Parameter | Value |
-|-----------|-------|
-| **Indicators** | SuperTrend (20, 2) + MACD (12, 26, 9) + VWAP + PCR |
-| **Timeframe** | 15 minutes |
-| **MACD Lookback** | 3 candles (waits for SuperTrend confirmation) |
-| **Entry** | Score ≥ 2.0 (MACD:1 + ST:1/1.5 + VWAP:0.5 + PCR:0.5) |
-| **Exit** | MACD reversal OR SuperTrend reversal |
-| **SL** | Previous candle low/high (dynamic) |
-| **Target** | None - hold till reversal |
-
-## 📊 Trading Modes
-
-### Mode 1: Index Options (`main.py`)
-| Index | Lot Size | Strike Interval |
-|-------|----------|-----------------|
-| NIFTY | 50 | 50 |
-| BANKNIFTY | 25 | 100 |
-
-### Mode 2: Stock Options (`main_stocks.py`) — Mixed Timeframe
-| Stock | Lot Size | Strike Gap | Timeframe | MACD LB |
-|-------|----------|------------|-----------|---------|
-| RELIANCE | 250 | ₹20 | 15min | 3 |
-| ICICIBANK | 700 | ₹12.5 | 30min | 3 |
-| SBIN | 750 | ₹5 | 30min | 3 |
-| AXISBANK | 625 | ₹25 | 30min | 5 |
-| LT | 150 | ₹25 | 15min | 5 |
-
-> Each stock runs on its optimal timeframe based on 60-day backtesting.
-
-## 🔄 Entry Logic (Scoring System)
-
-Each indicator contributes a weighted score:
-
-| Indicator | BUY Score | SELL Score |
-|-----------|-----------|------------|
-| MACD pending | +1.0 | +1.0 |
-| SuperTrend aligned | +1.0 | +1.0 |
-| SuperTrend FLIP bonus | +0.5 | +0.5 |
-| VWAP (above for BUY, below for SELL) | +0.5 | +0.5 |
-| PCR (< 1.0 for BUY, > 1.0 for SELL) | +0.5 | +0.5 |
-| **Threshold** | **≥ 2.0** | **≥ 2.0** |
-
-```
-Candle 1: ⚡ MACD Bullish Cross (valid for 3 more candles)
-Candle 2: ST still bearish... score 1.0 (MACD only)
-Candle 3: ✅ ST flips bullish + VWAP above → Score 3.0 → BUY!
-```
-
-## 🚪 Exit Conditions
-
-| Trigger | Action |
-|---------|--------|
-| MACD reversal | Exit immediately |
-| SuperTrend reversal | Exit immediately |
-| SL hit (prev candle) | Exit on tick |
-
-## 📁 Files
-
-```
-supertrend-bot/
-├── app.py                  # FastAPI server + daily loop
-├── main.py                 # Index options bot (NIFTY/BANKNIFTY)
-├── main_stocks.py          # Stock options bot (5 F&O stocks)
-├── angel_one.py            # PCR via Angel One SmartAPI
-├── auto_login.py           # Selenium auto-login (Kite)
-├── telegram_notifier.py    # Telegram notifications
-├── Dockerfile              # Docker config with Chromium
-├── render.yaml             # Render deployment config
-├── requirements.txt        # Python dependencies
-└── .env.example            # Environment template
-```
-
-## 🏃 Quick Start
-
-### Local Development
-
-```bash
-# Clone repository
-git clone https://github.com/RishaBhangale/AlgoBot.git
-cd AlgoBot
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your credentials
-
-# Run Index Bot
-python main.py
-
-# OR Run Stock Bot
-python main_stocks.py
-```
-
-### Run with Docker
-
-```bash
-docker build -t AlgoBot .
-docker run -p 10000:10000 --env-file .env AlgoBot
-```
-
-## ☁️ Render Deployment
-
-### Step 1: Push to GitHub
-
-```bash
-git add .
-git commit -m "Quad-Confirmation with MACD lookback"
-git push
-```
-
-### Step 2: Add Environment Variables
-
-In Render Dashboard → Environment:
-
-**Zerodha:**
-```
-KITE_API_KEY
-KITE_API_SECRET
-KITE_USER_ID
-KITE_PASSWORD
-KITE_TOTP_SECRET
-```
-
-**Telegram:**
-```
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
-```
-
-**Angel One (PCR):**
-```
-ANGEL_API_KEY
-ANGEL_SECRET_KEY
-ANGEL_CLIENT_ID
-ANGEL_MPIN
-ANGEL_TOTP_SECRET
-```
-
-### Step 3: Choose Bot Mode
-
-Edit `Dockerfile` CMD line:
-
-```dockerfile
-# For Index Options (NIFTY/BANKNIFTY):
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
-
-# For Stock Options (5 stocks):
-# Modify app.py to import main_stocks instead of main
-```
-
-## 🌐 API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /` | Health check |
-| `GET /status` | Bot status JSON |
-| `GET /logs` | Recent bot logs |
-
-## 📈 Indicators
-
-| Indicator | Purpose |
-|-----------|---------|
-| **SuperTrend (20,2)** | Trend direction + dynamic SL levels |
-| **MACD (12,26,9)** | Entry timing via crossovers |
-| **VWAP** | Fair value filter (real for stocks, estimated for indices) |
-| **PCR** | Market sentiment from Angel One OI data |
-
-## 📅 Daily Schedule
-
-| Time | Action |
-|------|--------|
-| 8:30 AM | Bot wakes up |
-| 8:45 AM | Selenium auto-login (fresh Kite token) |
-| 9:15 AM | Fetch data, calculate indicators |
-| 9:15 - 3:30 PM | Monitor for signals |
-| 3:30 PM | Generate daily report |
-
-## 📱 Telegram Alerts
-
-```
-✅ [RELIANCE] BUY SIGNAL! Score: 3.0/3.5
-   MACD:+1.0 | ST:+1.5(FLIP) | VWAP:+0.5(above) | PCR:N/A
-
-🔔 [RELIANCE] EXIT TRIGGERED: ST_REVERSAL
-   Entry: ₹245.00 → Exit: ₹278.50
-   P&L: ₹1,675
-```
-
-## 🛡️ Risk Management
-
-| Parameter | Value |
-|-----------|-------|
-| Max Concurrent Positions | 3 |
-| Per-Stock Capital | ₹25,000 |
-| Daily Loss Limit | ₹15,000 |
-| Position Sizing | 1 lot per signal |
-| Stocks Traded | 5 (RELIANCE, ICICIBANK, SBIN, AXISBANK, LT) |
+Automated F&O Stock Options trading bot for **RELIANCE, ICICIBANK, SBIN, AXISBANK, LT** utilizing the **Quad-Confirmation + Alligator Golden Zone Overlay** strategy with headless 2FA auto-login, dynamic conviction position sizing, and real-time Telegram alerting.
 
 ---
 
-## Support
+## 🎯 Core Architecture & Strategy
 
-For issues, check the logs at `/logs` endpoint or Telegram alerts.
+| Component | Specification | Description |
+| :--- | :--- | :--- |
+| **Securities** | RELIANCE, ICICIBANK, SBIN, AXISBANK, LT | Top 5 liquid institutional momentum F&O stocks |
+| **Execution Timeframes** | 15m (RELIANCE, LT), 30m (ICICIBANK, SBIN, AXISBANK) | Individual timeframes optimized for max Sharpe ratio |
+| **Macro Regime Filter** | 75-minute Alligator Swing Pivots | Dynamically tracks $P_{\text{low}}, P_{\text{high}}$ to define Fibonacci Golden Zone ($50\% - 65\%$) |
+| **Intraday Anchors** | 15-Minute Opening Range (09:15–09:30) & Rolling VWAP | Anchors intraday institutional equilibrium |
+| **Entry Engine** | Quad-Confirmation Scoring + Golden Zone Boost | MACD (+1.0) + SuperTrend (+1.0/+1.5) + VWAP (+0.5) + PCR (+0.5) + **GZ Confluence (+1.0)** |
+| **Conviction Sizing** | **2 Lots in Golden Zone**, **1 Lot Standard** | Amplifies sizing on high-probability institutional reload zones |
+| **Risk & SL** | Dynamic Structural Stop-Loss | Placed at previous swing pivot / candle extreme (delta-adjusted) |
+| **Auto Square-Off** | 15:15 IST (EOD Square-off) | Eliminates overnight gap risk |
+
+---
+
+## 📈 Scoring & Conviction System
+
+| Condition | BUY Score | SELL Score | Notes |
+| :--- | :---: | :---: | :--- |
+| **MACD Pending Cross** | +1.0 | +1.0 | Lookback of 3 to 5 candles |
+| **SuperTrend Aligned** | +1.0 | +1.0 | SuperTrend (20, 2) |
+| **SuperTrend Flip Bonus** | +0.5 | +0.5 | Fresh structural trend transition |
+| **VWAP Confirmation** | +0.5 | +0.5 | Price above/below cumulative session VWAP |
+| **PCR Alignment** | +0.5 | +0.5 | PCR < 1.0 (Bullish) or > 1.0 (Bearish) |
+| **Golden Zone Confluence** | **+1.0** | **+1.0** | Price / ORB inside $50\% - 65\%$ Fibonacci retracement |
+| **Counter-Trend Protection** | **BLOCKED** | **BLOCKED** | Suppresses CE buys inside Bear GZ (and PE buys inside Bull GZ) |
+| **Entry Threshold** | **≥ 2.0** | **≥ 2.0** | Max score: 4.5 |
+
+### 💎 Position Sizing Rules
+* **Inside Golden Zone**: Triggers **2 LOTS** (Amplified payoff on mean-reverting institutional rallies).
+* **Outside Golden Zone**: Triggers **1 LOT** (Standard trend-following breakout).
+
+---
+
+## 🛠️ Automated Daily Lifecycle (`run_bot.py`)
+
+No manual terminal interaction or token pasting required. The system runs autonomously:
+
+```
+ 08:50 AM IST ───► Headless Auto-Login (Generates fresh Kite token via HTTP + TOTP)
+ 09:14 AM IST ───► Pre-Market Setup (Subscribes to live WebSocket tick feed & fetches 75M GZ levels)
+ 09:15 AM IST ───► Market Opens (Establishes 15M ORB, processes 15m/30m candles in real-time)
+ Intraday     ───► Live Order Execution + Instant Telegram Notifications (Entry, SL, Exit, P&L)
+ 03:15 PM IST ───► Intraday Auto Square-Off (Closes any lingering open positions)
+ 03:30 PM IST ───► Market Closes (Computes metrics, writes logs/stocks_report_YYYY-MM-DD.json, sends EOD Telegram summary)
+ 03:31 PM IST ───► Standby Mode (Sleeps until 08:50 AM next trading day)
+```
+
+---
+
+## 🚀 How to Run
+
+### 1. Requirements & Dependencies
+Ensure Python 3.10+ is available:
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configure Credentials (`.env`)
+Create or edit `.env` in the project root:
+```ini
+KITE_API_KEY=your_kite_api_key
+KITE_API_SECRET=your_kite_api_secret
+KITE_USER_ID=your_zerodha_user_id
+KITE_PASSWORD=your_zerodha_password
+KITE_TOTP_SECRET=your_totp_secret_key
+
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
+```
+
+### 3. Start the Autonomous Daily Bot
+```bash
+python3 run_bot.py
+```
+To run permanently in the background (surviving terminal closure / disconnect):
+```bash
+nohup python3 run_bot.py > bot_output.log 2>&1 &
+```
+
+---
+
+## 📱 Telegram Alerts
+
+The bot delivers rich HTML notifications directly to your phone:
+* **Bot Start**: Alerts symbols loaded and system initialization.
+* **Trade Entry**: Security, Option Type (CE/PE), Strike, Entry Price, Dynamic SL, and Lot Size (`1 LOT` or `2 LOTS (Golden Zone Boost)`).
+* **Trade Exit**: Exit price, points captured, exit reason (`MACD_REVERSAL`, `SUPERTREND_REVERSAL`, `SL_HIT`, `EOD_SQUAREOFF`), and realized P&L.
+* **EOD Daily Summary**: Breakdown of trades, win rate, and total daily net P&L.
+
+---
+
+## 📊 Visualizing on TradingView
+
+The exact indicator script matching the Python bot logic is included in:
+* [`tradingview_stock_hybrid.pine`](file:///Users/rishabhbhangale/Desktop/Trading/supertrend-bot/tradingview_stock_hybrid.pine)
+
+Open TradingView $\to$ Pine Editor $\to$ Paste script $\to$ "Add to Chart". It visually highlights the 15M ORB, Alligator Golden Zone boxes, and displays exact Buy CE / Buy PE label tags with 1x/2x lot sizes.
+
+---
+
+## 📁 Clean Directory Structure
+
+```
+supertrend-bot/
+├── auto_login.py                 # Fast headless HTTP + TOTP Zerodha auto-login
+├── main_stocks.py                # Core Quad-Confirmation + Alligator Golden Zone Bot
+├── run_bot.py                    # Autonomous daily scheduler & lifecycle manager
+├── telegram_notifier.py          # Real-time Telegram alerting engine
+├── tradingview_stock_hybrid.pine # TradingView Pine Script v5 indicator visualizer
+├── angel_one.py                  # PCR data module
+├── requirements.txt              # Production Python dependencies
+├── .env                          # Local credentials (gitignored)
+└── logs/                         # Automated daily reports (stocks_report_YYYY-MM-DD.json)
+```

@@ -371,6 +371,15 @@ class StockTrader:
         self.pending_macd_bullish = 0
         self.pending_macd_bearish = 0
         
+        # Alligator Fibonacci Golden Zone & 15M ORB
+        self.orb_high = None
+        self.orb_low = None
+        self.gz_bull_top = None
+        self.gz_bull_bot = None
+        self.gz_bear_top = None
+        self.gz_bear_bot = None
+        self.current_day = None
+        
         self.position: Optional[Position] = None
         self.trades: List[Position] = []
         self.signals: List[Dict] = []
@@ -421,6 +430,19 @@ class StockTrader:
     def _process_candle(self, candle: Dict):
         if len(self.candles) < ATR_PERIOD + 5:
             return
+            
+        # Day transition & 15M ORB capture
+        c_day = candle["timestamp"].date()
+        if self.current_day != c_day:
+            self.current_day = c_day
+            self.orb_high = None
+            self.orb_low = None
+            
+        c_time = candle["timestamp"].time()
+        if c_time.hour == 9 and c_time.minute == 15:
+            self.orb_high = candle["high"]
+            self.orb_low = candle["low"]
+            self.logger(f"🎯 [{self.symbol}] 15M ORB Established: High=₹{self.orb_high:.1f}, Low=₹{self.orb_low:.1f}")
         
         df = pd.DataFrame(self.candles[-50:])
         df = calculate_supertrend(df, ATR_PERIOD, ATR_MULTIPLIER)
@@ -512,6 +534,14 @@ class StockTrader:
             st_bullish = (self.current_trend == 1)
             st_bearish = (self.current_trend == -1)
             
+            # Check Golden Zone Confluence
+            in_bull_gz = False
+            in_bear_gz = False
+            if self.gz_bull_top is not None and self.gz_bull_bot is not None:
+                in_bull_gz = (self.gz_bull_bot <= candle['close'] <= self.gz_bull_top) or (self.orb_low is not None and self.gz_bull_bot <= self.orb_low <= self.gz_bull_top)
+            if self.gz_bear_top is not None and self.gz_bear_bot is not None:
+                in_bear_gz = (self.gz_bear_bot <= candle['close'] <= self.gz_bear_top) or (self.orb_high is not None and self.gz_bear_bot <= self.orb_high <= self.gz_bear_top)
+
             # ----- BUY SCORING -----
             if self.pending_macd_bullish > 0:
                 buy_score = 0.0
@@ -549,11 +579,22 @@ class StockTrader:
                 else:
                     buy_breakdown.append("PCR:N/A")
                 
+                # Hybrid Golden Zone Confluence Boost (+1.0)
+                if in_bull_gz:
+                    buy_score += 1.0
+                    buy_breakdown.append("GZ_BOOST:+1.0(BULL)")
+                    
+                # Counter-Trend Protection: Do not buy CE into opposing Bearish Golden Zone
+                if in_bear_gz and not in_bull_gz:
+                    buy_score = 0.0
+                    buy_breakdown.append("BLOCKED_BY_BEAR_GZ")
+                
                 # === Decision ===
                 if buy_score >= self.ENTRY_SCORE_THRESHOLD:
-                    print(f"\n✅ [{self.symbol}] BUY SIGNAL! Score: {buy_score:.1f}/{3.5:.1f}", flush=True)
+                    lots_tag = "2 LOTS (Golden Zone Confluence)" if in_bull_gz else "1 LOT (Standard)"
+                    print(f"\n✅ [{self.symbol}] BUY SIGNAL! Score: {buy_score:.1f}/{4.5:.1f} | Sizing: {lots_tag}", flush=True)
                     print(f"   {' | '.join(buy_breakdown)}", flush=True)
-                    self._enter_position("BUY", candle, prev)
+                    self._enter_position("BUY", candle, prev, in_gz=in_bull_gz)
                     self.pending_macd_bullish = 0
                 elif buy_score >= 1.0:
                     # Near-miss: log for MFE tracking
@@ -601,11 +642,22 @@ class StockTrader:
                 else:
                     sell_breakdown.append("PCR:N/A")
                 
+                # Hybrid Golden Zone Confluence Boost (+1.0)
+                if in_bear_gz:
+                    sell_score += 1.0
+                    sell_breakdown.append("GZ_BOOST:+1.0(BEAR)")
+                    
+                # Counter-Trend Protection: Do not buy PE into opposing Bullish Golden Zone
+                if in_bull_gz and not in_bear_gz:
+                    sell_score = 0.0
+                    sell_breakdown.append("BLOCKED_BY_BULL_GZ")
+                
                 # === Decision ===
                 if sell_score >= self.ENTRY_SCORE_THRESHOLD:
-                    print(f"\n✅ [{self.symbol}] SELL SIGNAL! Score: {sell_score:.1f}/{3.5:.1f}", flush=True)
+                    lots_tag = "2 LOTS (Golden Zone Confluence)" if in_bear_gz else "1 LOT (Standard)"
+                    print(f"\n✅ [{self.symbol}] SELL SIGNAL! Score: {sell_score:.1f}/{4.5:.1f} | Sizing: {lots_tag}", flush=True)
                     print(f"   {' | '.join(sell_breakdown)}", flush=True)
-                    self._enter_position("SELL", candle, prev)
+                    self._enter_position("SELL", candle, prev, in_gz=in_bear_gz)
                     self.pending_macd_bearish = 0
                 elif sell_score >= 1.0:
                     print(f"   📊 [{self.symbol}] SELL score {sell_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(sell_breakdown)}", flush=True)
@@ -626,7 +678,7 @@ class StockTrader:
                 if self.pending_macd_bearish == 0:
                     print(f"   ⌛ [{self.symbol}] MACD Bearish expired", flush=True)
     
-    def _enter_position(self, signal: str, candle: Dict, prev_candle: Dict = None):
+    def _enter_position(self, signal: str, candle: Dict, prev_candle: Dict = None, in_gz: bool = False):
         spot = candle["close"]
         option_type = "CE" if signal == "BUY" else "PE"
         
@@ -645,28 +697,32 @@ class StockTrader:
         else:
             sl = entry_price * 0.85
         
+        # Conviction Sizing: 2 lots in Golden Zone, 1 lot standard
+        lot_multiplier = 2 if in_gz else 1
+        qty = self.config["lot_size"] * lot_multiplier
+        
         self.position = Position(
             symbol=self.symbol,
             option_type=option_type,
             strike=strike,
             entry_price=entry_price,
             sl=sl,
-            quantity=self.config["lot_size"],
+            quantity=qty,
             entry_time=now_ist(),
             spot_at_entry=spot
         )
         
         emoji = "🟢" if signal == "BUY" else "🔴"
+        gz_label = "2 LOTS (Golden Zone Boost)" if in_gz else "1 LOT (Standard)"
         print(f"\n{'='*50}", flush=True)
-        print(f"{emoji} [{self.symbol}] ENTRY - {option_type} {strike}", flush=True)
-        print(f"   Entry: ₹{entry_price:.2f} | SL: ₹{sl:.2f}", flush=True)
-        print(f"   Qty: {self.config['lot_size']}", flush=True)
+        print(f"{emoji} [{self.symbol}] ENTRY - {option_type} {strike} | {gz_label}", flush=True)
+        print(f"   Entry: ₹{entry_price:.2f} | SL: ₹{sl:.2f} | Qty: {qty}", flush=True)
         print(f"{'='*50}\n", flush=True)
         
         if self.telegram:
             self.telegram.notify_trade_entry(
                 self.symbol, option_type, strike, entry_price, 0, sl,
-                self.config["lot_size"], signal
+                qty, signal + f" ({gz_label})"
             )
     
     def _close_position(self, current_spot: float, reason: str):
@@ -750,15 +806,24 @@ class StockOptionsBot:
         print(line, flush=True)
     
     def _load_credentials(self):
+        try:
+            from auto_login import load_credentials
+            creds = load_credentials()
+            if creds.get("api_key") and creds.get("api_secret"):
+                return creds["api_key"], creds["api_secret"]
+        except Exception:
+            pass
+            
         api_key = os.environ.get("KITE_API_KEY", "")
         api_secret = os.environ.get("KITE_API_SECRET", "")
         
         if not api_key or not api_secret:
-            api_file = BASE_DIR / "api_key.txt"
-            if api_file.exists():
-                lines = api_file.read_text().strip().split("\n")
-                api_key = lines[0].strip()
-                api_secret = lines[1].strip() if len(lines) > 1 else ""
+            for p in [BASE_DIR / "api_key.txt", BASE_DIR.parent / "api_key.txt"]:
+                if p.exists():
+                    lines = p.read_text().strip().split("\n")
+                    api_key = lines[0].strip()
+                    api_secret = lines[1].strip() if len(lines) > 1 else ""
+                    break
         
         return api_key, api_secret
     
@@ -771,12 +836,46 @@ class StockOptionsBot:
             api_key, api_secret = self._load_credentials()
             self.kite = KiteConnect(api_key=api_key)
             
+            # 1. Check existing access_token.txt
+            token_file = BASE_DIR / "access_token.txt"
+            if token_file.exists():
+                token = token_file.read_text().strip()
+                if token:
+                    self.kite.set_access_token(token)
+                    try:
+                        profile = self.kite.profile()
+                        self._log(f"✅ Reusing valid access token. Logged in as: {profile.get('user_name', 'N/A')}")
+                        return True
+                    except Exception:
+                        self._log("⚠️ Saved token expired, performing automated login...")
+            
+            # 2. Automated login via KiteAutoLogin (headless HTTP + 2FA TOTP)
+            try:
+                from auto_login import KiteAutoLogin, load_credentials
+                creds = load_credentials()
+                auto_login = KiteAutoLogin(
+                    api_key=creds["api_key"],
+                    api_secret=creds["api_secret"],
+                    user_id=creds["user_id"],
+                    password=creds["password"],
+                    totp_secret=creds["totp_secret"],
+                    headless=True
+                )
+                access_token = auto_login.login()
+                if access_token:
+                    self.kite.set_access_token(access_token)
+                    profile = self.kite.profile()
+                    self._log(f"✅ Auto-login successful! Logged in as: {profile.get('user_name', 'N/A')}")
+                    return True
+            except Exception as e:
+                self._log(f"⚠️ Auto-login failed: {e}")
+            
+            # 3. Manual Fallback
             login_url = self.kite.login_url()
             print("\n" + "=" * 60)
-            print("🔐 KITE LOGIN")
+            print("🔐 KITE MANUAL LOGIN FALLBACK")
             print("=" * 60)
             print(f"URL: {login_url}")
-            
             try:
                 webbrowser.open(login_url)
             except:
@@ -788,7 +887,7 @@ class StockOptionsBot:
             
             data = self.kite.generate_session(request_token, api_secret)
             self.kite.set_access_token(data["access_token"])
-            
+            open(BASE_DIR / "access_token.txt", "w").write(data["access_token"])
             self._log(f"✅ Logged in: {data.get('user_name', 'N/A')}")
             return True
             
@@ -846,7 +945,7 @@ class StockOptionsBot:
             return False
     
     def fetch_historical(self):
-        """Fetch historical data for all stocks."""
+        """Fetch historical data for execution candles and macro Golden Zone."""
         if not self.kite:
             return
         
@@ -877,6 +976,24 @@ class StockOptionsBot:
                     })
                 
                 print(f"   ✓ {symbol}: {len(trader.candles)} candles", flush=True)
+                
+                # Fetch 60-min data for macro Alligator & Golden Zone
+                htf_data = self.kite.historical_data(
+                    instrument_token=config["instrument_token"],
+                    from_date=to_date - timedelta(days=25),
+                    to_date=to_date,
+                    interval="60minute"
+                )
+                if htf_data:
+                    htf_df = pd.DataFrame(htf_data)
+                    swing_high = htf_df['high'].rolling(10).max().iloc[-1]
+                    swing_low = htf_df['low'].rolling(10).min().iloc[-1]
+                    rng = swing_high - swing_low
+                    trader.gz_bull_top = swing_high - (0.50 * rng)
+                    trader.gz_bull_bot = swing_high - (0.65 * rng)
+                    trader.gz_bear_bot = swing_low + (0.50 * rng)
+                    trader.gz_bear_top = swing_low + (0.65 * rng)
+                    print(f"   🏛️ [{symbol}] Macro Swings: High=₹{swing_high:.1f}, Low=₹{swing_low:.1f} | Bull GZ: ₹{trader.gz_bull_bot:.1f}-₹{trader.gz_bull_top:.1f}", flush=True)
                 
             except Exception as e:
                 print(f"   ✗ {symbol}: {e}", flush=True)

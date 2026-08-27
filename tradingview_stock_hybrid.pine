@@ -1,0 +1,221 @@
+//@version=5
+indicator("AGY Stock Hybrid Overlay (SuperTrend + Alligator Golden Zone + ORB)", overlay=true, max_lines_count=500, max_boxes_count=500)
+
+// ==============================================================================
+// 1. INPUT PARAMETERS
+// ==============================================================================
+grp_st      = "1. SuperTrend Settings"
+st_period   = input.int(20, "ATR Period", group=grp_st)
+st_mult     = input.float(2.0, "ATR Multiplier", step=0.1, group=grp_st)
+
+grp_macd    = "2. MACD Settings"
+macd_fast   = input.int(12, "Fast EMA", group=grp_macd)
+macd_slow   = input.int(26, "Slow EMA", group=grp_macd)
+macd_sig    = input.int(9, "Signal EMA", group=grp_macd)
+macd_lb     = input.int(3, "MACD Signal Persistence (Bars)", tooltip="3 for RELIANCE/ICICI/SBIN, 5 for AXIS/LT", group=grp_macd)
+
+grp_alli    = "3. Macro Alligator & Golden Zone (HTF 75M)"
+htf_tf      = input.timeframe("75", "Higher Timeframe", group=grp_alli)
+show_gz     = input.bool(true, "Show Fibonacci Golden Zone", group=grp_alli)
+
+grp_orb     = "4. Opening Range Breakout (15M)"
+show_orb    = input.bool(true, "Show 15M ORB Levels (09:15-09:30)", group=grp_orb)
+
+// ==============================================================================
+// 2. INTRADAY VWAP & SUPERTREND
+// ==============================================================================
+// VWAP
+v_val = ta.vwap(hlc3)
+plot(v_val, "Intraday VWAP", color=color.new(color.purple, 20), linewidth=2)
+
+// SuperTrend (20, 2)
+[st_value, st_direction] = ta.supertrend(st_mult, st_period)
+st_bull = st_direction < 0
+st_bear = st_direction > 0
+st_flip_bull = st_bull and st_direction[1] > 0
+st_flip_bear = st_bear and st_direction[1] < 0
+
+plot(st_bull ? st_value : na, "SuperTrend Up", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(st_bear ? st_value : na, "SuperTrend Down", color=color.red, style=plot.style_linebr, linewidth=2)
+
+// MACD (12, 26, 9)
+[macd_line, macd_signal_line, _] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+macd_bull_cross = ta.crossover(macd_line, macd_signal_line)
+macd_bear_cross = ta.crossunder(macd_line, macd_signal_line)
+
+// Track MACD persistence within lookback bars
+var int pending_macd_bull = 0
+var int pending_macd_bear = 0
+
+if macd_bull_cross
+    pending_macd_bull := macd_lb + 1
+    pending_macd_bear := 0
+else if pending_macd_bull > 0
+    pending_macd_bull := pending_macd_bull - 1
+
+if macd_bear_cross
+    pending_macd_bear := macd_lb + 1
+    pending_macd_bull := 0
+else if pending_macd_bear > 0
+    pending_macd_bear := pending_macd_bear - 1
+
+// ==============================================================================
+// 3. 15-MINUTE OPENING RANGE BREAKOUT (09:15 - 09:30)
+// ==============================================================================
+is_new_day = ta.change(time("D")) != 0
+in_orb_window = (time(timeframe.period, "0915-0930") != 0)
+
+var float orb_high = na
+var float orb_low = na
+
+if is_new_day
+    orb_high := na
+    orb_low := na
+
+if in_orb_window
+    orb_high := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low  := na(orb_low)  ? low  : math.min(orb_low, low)
+
+plot(show_orb ? orb_high : na, "ORB High", color=color.new(color.teal, 30), linewidth=2, style=plot.style_circles)
+plot(show_orb ? orb_low : na, "ORB Low", color=color.new(color.maroon, 30), linewidth=2, style=plot.style_circles)
+
+// ==============================================================================
+// 4. MACRO ALLIGATOR & FIBONACCI GOLDEN ZONE (75M / HTF)
+// ==============================================================================
+f_smma(src, len) =>
+    var float smma = na
+    smma := na(smma) ? ta.sma(src, len) : (smma * (len - 1) + src) / len
+    smma
+
+htf_hl2 = request.security(syminfo.tickerid, htf_tf, hl2, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htf_high = request.security(syminfo.tickerid, htf_tf, high, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htf_low  = request.security(syminfo.tickerid, htf_tf, low, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// Fractal Highs/Lows on HTF (5-bar fractal)
+htf_swing_high = request.security(syminfo.tickerid, htf_tf, ta.highest(high, 20), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htf_swing_low  = request.security(syminfo.tickerid, htf_tf, ta.lowest(low, 20), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// Dynamic Fibonacci Retracement Levels
+rng = htf_swing_high - htf_swing_low
+gz_bull_top = htf_swing_high - (0.50 * rng)
+gz_bull_bot = htf_swing_high - (0.65 * rng)
+gz_bear_bot = htf_swing_low + (0.50 * rng)
+gz_bear_top = htf_swing_low + (0.65 * rng)
+
+// Check if current candle or ORB is inside Golden Zone
+in_bull_gz = (close >= gz_bull_bot and close <= gz_bull_top) or (not na(orb_low) and orb_low >= gz_bull_bot and orb_low <= gz_bull_top)
+in_bear_gz = (close >= gz_bear_bot and close <= gz_bear_top) or (not na(orb_high) and orb_high >= gz_bear_bot and orb_high <= gz_bear_top)
+
+// Golden Zone Visual Box
+var box gz_box = na
+if show_gz and is_new_day
+    box.delete(gz_box)
+    gz_box := box.new(left=bar_index, top=gz_bull_top, right=bar_index + 25, bottom=gz_bull_bot, bgcolor=color.new(color.yellow, 85), border_color=color.orange, border_style=line.style_dashed)
+else if show_gz and not na(gz_box)
+    box.set_right(gz_box, bar_index + 10)
+
+// ==============================================================================
+// 5. HYBRID ENTRY SCORING & SIZING ENGINE
+// ==============================================================================
+is_session_active = (time(timeframe.period, "0930-1500") != 0)
+
+// Buy Score (CE)
+float buy_score = 0.0
+if pending_macd_bull > 0
+    buy_score := buy_score + 1.0
+if st_bull
+    buy_score := buy_score + (st_flip_bull ? 1.5 : 1.0)
+if close > v_val
+    buy_score := buy_score + 0.5
+if in_bull_gz
+    buy_score := buy_score + 1.0 // Golden Zone Confluence Boost!
+
+// Sell Score (PE)
+float sell_score = 0.0
+if pending_macd_bear > 0
+    sell_score := sell_score + 1.0
+if st_bear
+    sell_score := sell_score + (st_flip_bear ? 1.5 : 1.0)
+if close < v_val
+    sell_score := sell_score + 0.5
+if in_bear_gz
+    sell_score := sell_score + 1.0 // Golden Zone Confluence Boost!
+
+// Signal Logic (Threshold >= 2.0)
+bool buy_ce_signal  = (buy_score >= 2.0) and is_session_active and not (in_bear_gz and not in_bull_gz)
+bool sell_pe_signal = (sell_score >= 2.0) and is_session_active and not (in_bull_gz and not in_bear_gz)
+
+// Position State Tracker
+var string pos_type = "NONE"
+var float pos_sl = na
+var int pos_lots = 1
+
+bool enter_ce = false
+bool enter_pe = false
+bool exit_trade = false
+string exit_msg = ""
+
+if pos_type == "NONE"
+    if buy_ce_signal
+        pos_type := "CE"
+        pos_lots := in_bull_gz ? 2 : 1
+        pos_sl := low[1]
+        enter_ce := true
+    else if sell_pe_signal
+        pos_type := "PE"
+        pos_lots := in_bear_gz ? 2 : 1
+        pos_sl := high[1]
+        enter_pe := true
+
+else if pos_type == "CE"
+    if macd_bear_cross
+        exit_trade := true
+        exit_msg := "MACD Reversal"
+        pos_type := "NONE"
+    else if st_flip_bear
+        exit_trade := true
+        exit_msg := "SuperTrend Flip"
+        pos_type := "NONE"
+    else if time(timeframe.period, "1515-1530") != 0
+        exit_trade := true
+        exit_msg := "EOD 15:15"
+        pos_type := "NONE"
+    else if close < pos_sl
+        exit_trade := true
+        exit_msg := "Stop Loss Hit"
+        pos_type := "NONE"
+
+else if pos_type == "PE"
+    if macd_bull_cross
+        exit_trade := true
+        exit_msg := "MACD Reversal"
+        pos_type := "NONE"
+    else if st_flip_bull
+        exit_trade := true
+        exit_msg := "SuperTrend Flip"
+        pos_type := "NONE"
+    else if time(timeframe.period, "1515-1530") != 0
+        exit_trade := true
+        exit_msg := "EOD 15:15"
+        pos_type := "NONE"
+    else if close > pos_sl
+        exit_trade := true
+        exit_msg := "Stop Loss Hit"
+        pos_type := "NONE"
+
+// ==============================================================================
+// 6. VISUAL PLOTS & LABELS
+// ==============================================================================
+plotshape(enter_ce, "BUY CE", shape.labelup, location.belowbar, color=color.green, text="BUY CE\n" + (in_bull_gz ? "2 LOTS" : "1 LOT"), textcolor=color.white, size=size.normal)
+plotshape(enter_pe, "BUY PE", shape.labeldown, location.abovebar, color=color.red, text="BUY PE\n" + (in_bear_gz ? "2 LOTS" : "1 LOT"), textcolor=color.white, size=size.normal)
+plotshape(exit_trade, "EXIT", shape.xcross, location.abovebar, color=color.orange, text="EXIT\n" + exit_msg, textcolor=color.white, size=size.small)
+
+// Table Dashboard
+var table dash = table.new(position.top_right, 4, 3, bgcolor=color.new(color.black, 30), border_color=color.gray, border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "Metric", bgcolor=color.navy, text_color=color.white)
+    table.cell(dash, 1, 0, "Status", bgcolor=color.navy, text_color=color.white)
+    table.cell(dash, 0, 1, "Regime / GZ", text_color=color.white)
+    table.cell(dash, 1, 1, in_bull_gz ? "Bullish GZ (2x Lots)" : in_bear_gz ? "Bearish GZ (2x Lots)" : "Standard (1 Lot)", bgcolor=in_bull_gz ? color.green : in_bear_gz ? color.red : color.gray, text_color=color.white)
+    table.cell(dash, 0, 2, "Active Position", text_color=color.white)
+    table.cell(dash, 1, 2, pos_type + (pos_type != "NONE" ? " (" + str.tostring(pos_lots) + " Lots)" : ""), bgcolor=pos_type == "CE" ? color.green : pos_type == "PE" ? color.red : color.gray, text_color=color.white)

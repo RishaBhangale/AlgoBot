@@ -164,19 +164,83 @@ class KiteAutoLogin:
         totp = pyotp.TOTP(self.totp_secret)
         return totp.now()
     
+    def login_http(self) -> Optional[str]:
+        """Fast headless auto-login via HTTP API and 2FA TOTP (no browser/Selenium needed)."""
+        import requests
+        from urllib.parse import urlparse, parse_qs
+        
+        if not self.user_id or not self.password or not self.totp_secret:
+            return None
+            
+        try:
+            log("🚀 Attempting fast headless HTTP auto-login...")
+            session = requests.Session()
+            
+            # Step 1: Login credentials
+            res = session.post("https://kite.zerodha.com/api/login", data={"user_id": self.user_id, "password": self.password})
+            if res.status_code != 200:
+                log(f"⚠️ HTTP login failed: {res.text}")
+                return None
+            req_id = res.json().get("data", {}).get("request_id")
+            if not req_id:
+                return None
+                
+            # Step 2: 2FA TOTP
+            totp_val = self._get_totp()
+            res2 = session.post("https://kite.zerodha.com/api/twofa", data={"user_id": self.user_id, "request_id": req_id, "twofa_value": totp_val, "twofa_type": "totp"})
+            if res2.status_code != 200:
+                log(f"⚠️ 2FA failed: {res2.text}")
+                return None
+                
+            # Step 3: OAuth redirect
+            login_url = f"https://kite.zerodha.com/connect/login?api_key={self.api_key}&v=3"
+            r1 = session.get(login_url, allow_redirects=False)
+            if 'Location' not in r1.headers:
+                return None
+            r2 = session.get(r1.headers['Location'], allow_redirects=False)
+            loc = r2.headers.get('Location', '')
+            
+            if "request_token=" in loc:
+                parsed = urlparse(loc)
+                request_token = parse_qs(parsed.query)["request_token"][0]
+                log(f"✅ Extracted request token: {request_token[:10]}...")
+                
+                # Step 4: Generate Session
+                self.kite = KiteConnect(api_key=self.api_key)
+                data = self.kite.generate_session(request_token, self.api_secret)
+                self.access_token = data["access_token"]
+                self.kite.set_access_token(self.access_token)
+                self._save_token(data)
+                
+                # Save plain text token for other modules
+                open(BASE_DIR / "access_token.txt", "w").write(self.access_token)
+                parent_token = BASE_DIR.parent / "access_token.txt"
+                if parent_token.parent.exists():
+                    open(parent_token, "w").write(self.access_token)
+                    
+                log(f"✅ Fast HTTP auto-login successful! Logged in as: {data.get('user_name', 'N/A')}")
+                return self.access_token
+        except Exception as e:
+            log(f"⚠️ Fast HTTP login encountered error: {e}")
+            return None
+
     def login(self) -> Optional[str]:
         """
         Perform automated login and return access token.
-        
-        Returns:
-            Access token string or None if failed
+        Tries fast HTTP login first, falls back to Selenium if needed.
         """
         if not KITE_AVAILABLE:
             log("❌ kiteconnect not installed")
             return None
         
+        # Try fast headless HTTP login first
+        token = self.login_http()
+        if token:
+            return token
+            
+        log("🔄 Falling back to Selenium browser login...")
         try:
-            log("🚀 Starting Kite auto-login...")
+            log("🚀 Starting Kite browser auto-login...")
             
             # Initialize Kite
             self.kite = KiteConnect(api_key=self.api_key)
@@ -391,10 +455,6 @@ def main():
     
     # Check dependencies
     missing = []
-    if not SELENIUM_AVAILABLE:
-        missing.append("selenium")
-    if not WEBDRIVER_MANAGER_AVAILABLE:
-        missing.append("webdriver-manager")
     if not PYOTP_AVAILABLE:
         missing.append("pyotp")
     if not KITE_AVAILABLE:
