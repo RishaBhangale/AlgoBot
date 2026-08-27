@@ -314,6 +314,30 @@ def run_trading_bot():
             time.sleep(600)  # Wait 10 mins on error
 
 
+def keepalive_pinger():
+    """Background thread that pings RENDER_EXTERNAL_URL every 8 minutes to prevent Render free-tier sleep."""
+    import requests
+    render_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SELF_PING_URL")
+    if not render_url:
+        add_log("ℹ️ No RENDER_EXTERNAL_URL detected; use UptimeRobot for external pinging if running on Render free tier.")
+        return
+        
+    ping_url = render_url.rstrip("/") + "/ping"
+    add_log(f"⏰ Render Keep-Alive self-pinger active: pinging {ping_url} every 8 minutes...")
+    
+    while True:
+        try:
+            time.sleep(480)  # 8 minutes (Render timeout is 15 minutes)
+            now = now_ist()
+            # Ping on weekdays between 08:30 AM and 03:45 PM IST
+            if now.weekday() < 5 and (8 <= now.hour < 16):
+                r = requests.get(ping_url, timeout=10)
+                if r.status_code == 200:
+                    add_log("💓 Keep-alive self-ping sent to Render router (container awake)")
+        except Exception as e:
+            add_log(f"⚠️ Keep-alive ping warning: {e}")
+
+
 def start_bot_thread():
     """Start the trading bot in a background thread."""
     global bot_thread
@@ -334,13 +358,15 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     add_log("🌐 FastAPI starting up...")
     start_bot_thread()
+    pinger_thread = threading.Thread(target=keepalive_pinger, name="KeepAlivePinger", daemon=True)
+    pinger_thread.start()
     yield
     add_log("🛑 FastAPI shutting down...")
 
 
 app = FastAPI(
-    title="Supertrend Trading Bot",
-    description="NIFTY & BANKNIFTY Options Trading Bot - Daily Auto-Login",
+    title="Stock Options Trading Bot",
+    description="Quad-Confirmation + Alligator Golden Zone Stock Bot - Daily Auto-Login",
     version="2.0.0",
     lifespan=lifespan
 )
