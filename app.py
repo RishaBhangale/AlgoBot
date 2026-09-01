@@ -412,8 +412,11 @@ async def detailed_status():
     if bot_instance and hasattr(bot_instance, 'traders'):
         status["positions"] = {}
         status["trades_today"] = {}
+        status["diagnostics"] = {}
         
         for symbol, trader in bot_instance.traders.items():
+            if hasattr(trader, 'get_diagnostics'):
+                status["diagnostics"][symbol] = trader.get_diagnostics()
             status["positions"][symbol] = {
                 "has_position": trader.position is not None,
                 "option_type": trader.position.option_type if trader.position else None,
@@ -424,6 +427,19 @@ async def detailed_status():
             status["trades_today"][symbol] = len(trader.trades)
     
     return status
+
+
+@app.get("/diagnostics")
+async def diagnostics_endpoint():
+    """Dedicated diagnostic endpoint returning real-time filter breakdown and telemetry."""
+    global bot_instance
+    if not bot_instance or not hasattr(bot_instance, 'traders'):
+        return {"status": "bot_not_initialized", "diagnostics": {}}
+    return {
+        "timestamp": now_ist().isoformat(),
+        "market_open": bot_instance.is_market_open(),
+        "diagnostics": {s: t.get_diagnostics() for s, t in bot_instance.traders.items()}
+    }
 
 
 @app.get("/logs")

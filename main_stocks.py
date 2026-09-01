@@ -389,12 +389,23 @@ class StockTrader:
         
         self.tick_count = 0
         self.candle_count = 0
+        self.ltp = 0.0
+        
+        # Diagnostic Telemetry
+        self.peak_score = 0.0
+        self.peak_score_breakdown = []
+        self.peak_score_direction = None
+        self.peak_score_time = None
+        self.last_near_miss_notified_time = None
+        self.primary_block_reason = "No confirmed MACD crossover formed"
+        
         self.lock = Lock()
 
     
     def process_tick(self, ltp: float, tick_time: datetime, volume: int = 0):
         with self.lock:
             self.tick_count += 1
+            self.ltp = ltp
             
             if self.tick_count % 100 == 0:
                 print(f"[TICK] [{self.symbol}] #{self.tick_count} LTP: {ltp:.2f}", flush=True)
@@ -589,6 +600,13 @@ class StockTrader:
                     buy_score = 0.0
                     buy_breakdown.append("BLOCKED_BY_BEAR_GZ")
                 
+                # Update peak score and diagnostic block reason
+                if buy_score > self.peak_score:
+                    self.peak_score = buy_score
+                    self.peak_score_breakdown = list(buy_breakdown)
+                    self.peak_score_direction = "BUY"
+                    self.peak_score_time = candle["timestamp"]
+                
                 # === Decision ===
                 if buy_score >= self.ENTRY_SCORE_THRESHOLD:
                     lots_tag = "2 LOTS (Golden Zone Confluence)" if in_bull_gz else "1 LOT (Standard)"
@@ -596,14 +614,29 @@ class StockTrader:
                     print(f"   {' | '.join(buy_breakdown)}", flush=True)
                     self._enter_position("BUY", candle, prev, in_gz=in_bull_gz)
                     self.pending_macd_bullish = 0
-                elif buy_score >= 1.0:
-                    # Near-miss: log for MFE tracking
-                    print(f"   📊 [{self.symbol}] BUY score {buy_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(buy_breakdown)}", flush=True)
-                    self.blocked_signals.append({
-                        "direction": "BUY", "price": candle["close"],
-                        "score": buy_score, "time": candle["timestamp"],
-                        "breakdown": buy_breakdown, "mfe": 0, "candles_tracked": 0
-                    })
+                    self.primary_block_reason = "Order Executed"
+                else:
+                    if "BLOCKED_BY_BEAR_GZ" in buy_breakdown:
+                        self.primary_block_reason = "Blocked: Inside opposing Bearish Golden Zone"
+                    elif not st_bullish:
+                        self.primary_block_reason = "Blocked: SuperTrend is Bearish (No Trend Alignment)"
+                    elif candle['close'] <= self.vwap:
+                        self.primary_block_reason = "Blocked: Price below session VWAP"
+                    else:
+                        self.primary_block_reason = f"Score {buy_score:.1f} < 2.0 threshold"
+                        
+                    if buy_score >= 1.5 and self.telegram:
+                        if self.last_near_miss_notified_time is None or (candle["timestamp"] - self.last_near_miss_notified_time).total_seconds() >= 1800:
+                            self.telegram.notify_near_miss(self.symbol, "BUY (CE)", buy_score, buy_breakdown, candle["close"])
+                            self.last_near_miss_notified_time = candle["timestamp"]
+                            
+                    if buy_score >= 1.0:
+                        print(f"   📊 [{self.symbol}] BUY score {buy_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(buy_breakdown)}", flush=True)
+                        self.blocked_signals.append({
+                            "direction": "BUY", "price": candle["close"],
+                            "score": buy_score, "time": candle["timestamp"],
+                            "breakdown": buy_breakdown, "mfe": 0, "candles_tracked": 0
+                        })
             
             # ----- SELL SCORING -----
             if self.pending_macd_bearish > 0 and self.position is None:
@@ -652,6 +685,13 @@ class StockTrader:
                     sell_score = 0.0
                     sell_breakdown.append("BLOCKED_BY_BULL_GZ")
                 
+                # Update peak score and diagnostic block reason
+                if sell_score > self.peak_score:
+                    self.peak_score = sell_score
+                    self.peak_score_breakdown = list(sell_breakdown)
+                    self.peak_score_direction = "SELL"
+                    self.peak_score_time = candle["timestamp"]
+                
                 # === Decision ===
                 if sell_score >= self.ENTRY_SCORE_THRESHOLD:
                     lots_tag = "2 LOTS (Golden Zone Confluence)" if in_bear_gz else "1 LOT (Standard)"
@@ -659,13 +699,29 @@ class StockTrader:
                     print(f"   {' | '.join(sell_breakdown)}", flush=True)
                     self._enter_position("SELL", candle, prev, in_gz=in_bear_gz)
                     self.pending_macd_bearish = 0
-                elif sell_score >= 1.0:
-                    print(f"   📊 [{self.symbol}] SELL score {sell_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(sell_breakdown)}", flush=True)
-                    self.blocked_signals.append({
-                        "direction": "SELL", "price": candle["close"],
-                        "score": sell_score, "time": candle["timestamp"],
-                        "breakdown": sell_breakdown, "mfe": 0, "candles_tracked": 0
-                    })
+                    self.primary_block_reason = "Order Executed"
+                else:
+                    if "BLOCKED_BY_BULL_GZ" in sell_breakdown:
+                        self.primary_block_reason = "Blocked: Inside opposing Bullish Golden Zone"
+                    elif not st_bearish:
+                        self.primary_block_reason = "Blocked: SuperTrend is Bullish (No Trend Alignment)"
+                    elif candle['close'] >= self.vwap:
+                        self.primary_block_reason = "Blocked: Price above session VWAP"
+                    else:
+                        self.primary_block_reason = f"Score {sell_score:.1f} < 2.0 threshold"
+                        
+                    if sell_score >= 1.5 and self.telegram:
+                        if self.last_near_miss_notified_time is None or (candle["timestamp"] - self.last_near_miss_notified_time).total_seconds() >= 1800:
+                            self.telegram.notify_near_miss(self.symbol, "SELL (PE)", sell_score, sell_breakdown, candle["close"])
+                            self.last_near_miss_notified_time = candle["timestamp"]
+                            
+                    if sell_score >= 1.0:
+                        print(f"   📊 [{self.symbol}] SELL score {sell_score:.1f} < {self.ENTRY_SCORE_THRESHOLD} | {' | '.join(sell_breakdown)}", flush=True)
+                        self.blocked_signals.append({
+                            "direction": "SELL", "price": candle["close"],
+                            "score": sell_score, "time": candle["timestamp"],
+                            "breakdown": sell_breakdown, "mfe": 0, "candles_tracked": 0
+                        })
             
             # === Step 4: Decrement pending counters ===
             if self.pending_macd_bullish > 0:
@@ -762,6 +818,24 @@ class StockTrader:
         
         if estimated_price <= self.position.sl:
             self._close_position(current_ltp, "SL_HIT")
+    
+    def get_diagnostics(self) -> Dict:
+        """Return real-time diagnostic status and filter telemetry for this stock."""
+        st_state = "BULLISH" if (self.supertrend_value > 0 and self.ltp > self.supertrend_value) else ("BEARISH" if (self.supertrend_value > 0 and self.ltp < self.supertrend_value) else "NEUTRAL")
+        return {
+            "symbol": self.symbol,
+            "ticks": self.tick_count,
+            "candles": self.candle_count,
+            "ltp": self.ltp,
+            "trend": st_state,
+            "supertrend": round(self.supertrend_value, 2),
+            "vwap": round(self.vwap, 2),
+            "peak_score": round(self.peak_score, 1),
+            "peak_direction": self.peak_score_direction,
+            "peak_breakdown": self.peak_score_breakdown,
+            "block_reason": self.primary_block_reason,
+            "active_position": True if self.position else False
+        }
 
 
 # ============================================================
@@ -1093,10 +1167,12 @@ class StockOptionsBot:
         print(f"{'='*60}\n")
         
         # Send Telegram daily summary
+        # Send Telegram daily summary with rich diagnostics
+        diagnostics = {s: t.get_diagnostics() for s, t in self.traders.items()}
         if self.telegram:
             try:
-                self.telegram.notify_daily_summary(today, securities_data, total_pnl)
-                print("📱 Daily summary sent to Telegram", flush=True)
+                self.telegram.notify_daily_summary(today, securities_data, total_pnl, diagnostics=diagnostics)
+                print("📱 Daily summary with diagnostic matrix sent to Telegram", flush=True)
             except Exception as e:
                 print(f"⚠️ Telegram summary failed: {e}", flush=True)
         
@@ -1105,7 +1181,8 @@ class StockOptionsBot:
             "date": today,
             "stats": stats,
             "stocks": {s: {"trades": len(t.trades), "pnl": sum(p.pnl for p in t.trades)} 
-                       for s, t in self.traders.items()}
+                       for s, t in self.traders.items()},
+            "diagnostics": diagnostics
         }
         
         report_path = LOG_DIR / f"stocks_report_{today}.json"
@@ -1152,7 +1229,21 @@ class StockOptionsBot:
         self.fetch_historical()
         self.start_live_feed()
         
+        heartbeat_sent = False
         while self.is_running and self.is_market_open():
+            now = now_ist()
+            # 12:00 PM IST Mid-day Heartbeat
+            if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
+                if self.telegram:
+                    try:
+                        status_dict = {s: t.get_diagnostics() for s, t in self.traders.items()}
+                        total_ticks = sum(t.tick_count for t in self.traders.values())
+                        active_pos = sum(1 for t in self.traders.values() if t.position is not None)
+                        self.telegram.notify_midday_heartbeat(status_dict, total_ticks, active_pos)
+                        print("💓 Mid-day heartbeat sent to Telegram", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Mid-day heartbeat failed: {e}", flush=True)
+                heartbeat_sent = True
             time.sleep(1)
         
         self._log("Session ended.")
