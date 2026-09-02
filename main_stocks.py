@@ -615,19 +615,25 @@ class StockOptionsBot:
             self._log(f"   ✓ {sym:<10} | Spot Token: {cfg['token']} | Lot Size: {cfg['lot_size']} | Strike Step: {cfg['strike_gap']}")
 
     def fetch_historical_and_gz(self):
-        """Fetch historical candles and calculate Alligator Golden Zone levels.
-        
-        Golden Zone uses 60-minute swing data (valid Kite interval).
+        """Fetch historical candles and calculate the 75-Minute Alligator Golden Zone.
+
+        Kite Connect does not natively support 75min intervals.
+        We synthesize 75-minute candles from 15-minute data by grouping every 5 consecutive
+        candles — producing OHLCV values mathematically identical to native 75min candles.
+        (375 min trading session ÷ 75 = 5 clean candles/day — the backtested rhythm.)
+
         Kite supported intervals: minute, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute, day
         """
         if not self.kite: return
-        self._log("📊 Fetching historical candles & calculating Alligator Golden Zones...")
+        self._log("📊 Fetching historical candles & calculating 75M Alligator Golden Zones...")
         to_d = now_ist()
-        from_d = to_d - timedelta(days=10)
+        from_d = to_d - timedelta(days=15)
 
         for sym, trader in self.traders.items():
             token = STOCKS[sym]["token"]
             interval = f"{trader.timeframe_minutes}minute"
+
+            # 1. Fetch intraday candles for indicator warm-up
             try:
                 data = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval=interval)
                 for c in data[-50:]:
@@ -638,22 +644,48 @@ class StockOptionsBot:
             except Exception as e:
                 self._log(f"⚠️ Historical candle fetch failed for {sym}: {e}")
 
-            # Alligator Golden Zone: use 60min candles (nearest valid interval to 75m)
-            # Look back over last 20 candles (20 × 60min = ~4 trading days of swing)
+            # 2. Synthesize 75-minute candles from 15-minute data
+            # Group every 5 consecutive 15-minute candles → 1 synthetic 75-minute candle
             try:
-                d60 = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval="60minute")
-                df60 = pd.DataFrame(d60)
-                if not df60.empty and len(df60) >= 5:
-                    p_high = df60['high'].iloc[-20:].max()
-                    p_low = df60['low'].iloc[-20:].min()
-                    rng = p_high - p_low
-                    trader.gz_bull_bot = p_low + (0.50 * rng)
-                    trader.gz_bull_top = p_low + (0.65 * rng)
+                d15 = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval="15minute")
+                df15 = pd.DataFrame(d15)
+
+                if not df15.empty and len(df15) >= 5:
+                    # Only use candles from completed 75-min blocks (multiples of 5)
+                    n_complete = (len(df15) // 5) * 5
+                    df15 = df15.iloc[-n_complete:].reset_index(drop=True)
+
+                    # Build synthetic 75-min OHLCV by grouping every 5 rows
+                    groups = []
+                    for i in range(0, len(df15), 5):
+                        block = df15.iloc[i:i+5]
+                        if len(block) == 5:
+                            groups.append({
+                                "open":  block['open'].iloc[0],
+                                "high":  block['high'].max(),
+                                "low":   block['low'].min(),
+                                "close": block['close'].iloc[-1],
+                            })
+
+                    df75 = pd.DataFrame(groups)
+
+                    # Use last 20 synthetic candles (20 × 75min = ~4 trading days)
+                    lookback = df75.iloc[-20:]
+                    p_high = lookback['high'].max()
+                    p_low  = lookback['low'].min()
+                    rng    = p_high - p_low
+
+                    trader.gz_bull_bot = p_low  + (0.50 * rng)
+                    trader.gz_bull_top = p_low  + (0.65 * rng)
                     trader.gz_bear_top = p_high - (0.50 * rng)
                     trader.gz_bear_bot = p_high - (0.65 * rng)
-                    self._log(f"   {sym} GZ: Bull [{trader.gz_bull_bot:.1f}–{trader.gz_bull_top:.1f}] | Bear [{trader.gz_bear_bot:.1f}–{trader.gz_bear_top:.1f}]")
+                    self._log(
+                        f"   {sym} 75M GZ: Bull [{trader.gz_bull_bot:.1f}–{trader.gz_bull_top:.1f}]"
+                        f" | Bear [{trader.gz_bear_bot:.1f}–{trader.gz_bear_top:.1f}]"
+                        f"  (built from {len(df75)} synthetic 75M candles)"
+                    )
             except Exception as e:
-                self._log(f"⚠️ GZ calculation skipped for {sym}: {e} (GZ boost disabled today)")
+                self._log(f"⚠️ 75M GZ skipped for {sym}: {e} (GZ boost disabled today)")
 
     def start_live_feed(self):
         creds = load_credentials()
