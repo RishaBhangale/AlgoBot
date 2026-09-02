@@ -160,15 +160,20 @@ def run_single_trading_day() -> bool:
         heartbeat_sent = False
         pcr_last_updated = None
         
-        while bot_instance.is_running and bot_instance.is_market_open():
+        # Market close time: 15:30 IST. Give 5 extra mins buffer.
+        session_end = now_ist().replace(hour=15, minute=35, second=0, microsecond=0)
+        
+        while now_ist() < session_end:
             now = now_ist()
-            # 1. Update PCR every 15 mins
-            if pcr_last_updated is None or (now - pcr_last_updated).total_seconds() >= 900:
-                for sym in STOCKS.keys():
-                    bot_instance.pcr_tracker.update_stock_pcr(sym, bot_instance.nfo_df)
-                pcr_last_updated = now
+            
+            # 1. Update PCR every 15 mins (only during market hours)
+            if bot_instance.is_market_open():
+                if pcr_last_updated is None or (now - pcr_last_updated).total_seconds() >= 900:
+                    for sym in STOCKS.keys():
+                        bot_instance.pcr_tracker.update_stock_pcr(sym, bot_instance.nfo_df)
+                    pcr_last_updated = now
                 
-            # 2. Mid-Day Heartbeat at 12:00 PM IST
+            # 2. Mid-Day Heartbeat at 12:00 PM IST (fires once)
             if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
                 if bot_instance.telegram:
                     status_dict = {s: t.get_diagnostics() for s, t in bot_instance.traders.items()}
