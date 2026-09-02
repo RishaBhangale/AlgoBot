@@ -219,6 +219,7 @@ def run_trading_bot():
                 
         except Exception as e:
             add_log(f"❌ Daemon loop error: {e}")
+            traceback.print_exc()
             time.sleep(60)
 
 

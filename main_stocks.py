@@ -615,30 +615,45 @@ class StockOptionsBot:
             self._log(f"   ✓ {sym:<10} | Spot Token: {cfg['token']} | Lot Size: {cfg['lot_size']} | Strike Step: {cfg['strike_gap']}")
 
     def fetch_historical_and_gz(self):
-        """Fetch historical candles and calculate 75M Alligator Golden Zone levels."""
+        """Fetch historical candles and calculate Alligator Golden Zone levels.
+        
+        Golden Zone uses 60-minute swing data (valid Kite interval).
+        Kite supported intervals: minute, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute, day
+        """
         if not self.kite: return
         self._log("📊 Fetching historical candles & calculating Alligator Golden Zones...")
         to_d = now_ist()
         from_d = to_d - timedelta(days=10)
-        
+
         for sym, trader in self.traders.items():
             token = STOCKS[sym]["token"]
             interval = f"{trader.timeframe_minutes}minute"
-            data = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval=interval)
-            for c in data[-50:]:
-                trader.candles.append({
-                    "timestamp": c["date"], "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c.get("volume", 0)
-                })
-            # 75M GZ calculation
-            d75 = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval="75minute")
-            df75 = pd.DataFrame(d75)
-            p_high = df75['high'].iloc[-20:].max()
-            p_low = df75['low'].iloc[-20:].min()
-            rng = p_high - p_low
-            trader.gz_bull_bot = p_low + (0.50 * rng)
-            trader.gz_bull_top = p_low + (0.65 * rng)
-            trader.gz_bear_top = p_high - (0.50 * rng)
-            trader.gz_bear_bot = p_high - (0.65 * rng)
+            try:
+                data = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval=interval)
+                for c in data[-50:]:
+                    trader.candles.append({
+                        "timestamp": c["date"], "open": c["open"], "high": c["high"],
+                        "low": c["low"], "close": c["close"], "volume": c.get("volume", 0)
+                    })
+            except Exception as e:
+                self._log(f"⚠️ Historical candle fetch failed for {sym}: {e}")
+
+            # Alligator Golden Zone: use 60min candles (nearest valid interval to 75m)
+            # Look back over last 20 candles (20 × 60min = ~4 trading days of swing)
+            try:
+                d60 = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval="60minute")
+                df60 = pd.DataFrame(d60)
+                if not df60.empty and len(df60) >= 5:
+                    p_high = df60['high'].iloc[-20:].max()
+                    p_low = df60['low'].iloc[-20:].min()
+                    rng = p_high - p_low
+                    trader.gz_bull_bot = p_low + (0.50 * rng)
+                    trader.gz_bull_top = p_low + (0.65 * rng)
+                    trader.gz_bear_top = p_high - (0.50 * rng)
+                    trader.gz_bear_bot = p_high - (0.65 * rng)
+                    self._log(f"   {sym} GZ: Bull [{trader.gz_bull_bot:.1f}–{trader.gz_bull_top:.1f}] | Bear [{trader.gz_bear_bot:.1f}–{trader.gz_bear_top:.1f}]")
+            except Exception as e:
+                self._log(f"⚠️ GZ calculation skipped for {sym}: {e} (GZ boost disabled today)")
 
     def start_live_feed(self):
         creds = load_credentials()
