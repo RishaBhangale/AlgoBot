@@ -174,11 +174,127 @@ class Position:
 
 
 # ============================================================
+# PERSISTENT CAPITAL & RISK TRACKER
+# ============================================================
+class CapitalTracker:
+    """
+    Manages session trading capital, passive income counter (overall P&L),
+    and enforces dynamic concurrent position guardrails.
+    """
+    def __init__(self, base_capital: float = TOTAL_CAPITAL,
+                 per_slot_capital: float = PER_STOCK_CAPITAL_LIMIT,
+                 state_file: Path = BASE_DIR / "capital_state.json",
+                 logger=print):
+        self.base_capital = base_capital
+        self.per_slot_capital = per_slot_capital
+        self.state_file = state_file
+        self.logger = logger
+        
+        self.session_capital = self.base_capital
+        self.overall_pnl = 0.0
+        self.load_state()
+
+    def load_state(self):
+        # 1. Environment variable override if specified
+        env_session = os.environ.get("SESSION_CAPITAL")
+        env_overall = os.environ.get("OVERALL_PNL")
+        
+        if env_session is not None or env_overall is not None:
+            if env_session:
+                try: self.session_capital = float(env_session)
+                except: pass
+            if env_overall:
+                try: self.overall_pnl = float(env_overall)
+                except: pass
+            self.logger(f"💼 Capital initialized from ENV: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+            return
+            
+        # 2. Local state file persistence
+        if self.state_file.exists():
+            try:
+                data = json.loads(self.state_file.read_text())
+                self.session_capital = float(data.get("session_capital", self.base_capital))
+                self.overall_pnl = float(data.get("overall_pnl", 0.0))
+                self.logger(f"💼 Capital state loaded: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+            except Exception as e:
+                self.logger(f"⚠️ Error reading capital_state.json: {e}. Defaulting to ₹{self.base_capital:,.2f}")
+                self.session_capital = self.base_capital
+                self.overall_pnl = 0.0
+        else:
+            self.session_capital = self.base_capital
+            self.overall_pnl = 0.0
+            self.save_state()
+
+    def save_state(self):
+        try:
+            data = {
+                "base_capital": self.base_capital,
+                "session_capital": self.session_capital,
+                "overall_pnl": self.overall_pnl,
+                "last_updated": now_ist().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.state_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            self.logger(f"⚠️ Error saving capital_state.json: {e}")
+
+    def get_max_concurrent_positions(self) -> int:
+        if self.session_capital < self.per_slot_capital:
+            return 0
+        return min(MAX_CONCURRENT_POSITIONS, int(self.session_capital // self.per_slot_capital))
+
+    def can_open_position(self, current_open_count: int) -> tuple:
+        if self.session_capital <= 0:
+            return False, "Session capital is zero or depleted. Trading halted."
+        if self.session_capital < self.per_slot_capital:
+            return False, f"Session capital (₹{self.session_capital:,.2f}) is below minimum required per-slot capital (₹{self.per_slot_capital:,.2f})."
+        max_allowed = self.get_max_concurrent_positions()
+        if current_open_count >= max_allowed:
+            return False, f"Maximum concurrent positions reached ({current_open_count}/{max_allowed}) for capital ₹{self.session_capital:,.2f}."
+        return True, "OK"
+
+    def end_day(self, day_net_pnl: float) -> dict:
+        """
+        Processes End-of-Day P&L:
+        - If profit:
+            - overall_pnl += day_net_pnl (Passive income credited)
+            - tomorrow's session_capital = base_capital (₹1L) (Profits reaped)
+        - If loss:
+            - overall_pnl += day_net_pnl
+            - tomorrow's session_capital = max(0.0, session_capital + day_net_pnl) (Loss carried forward)
+        """
+        capital_used = self.session_capital
+        self.overall_pnl += day_net_pnl
+        
+        is_profit = day_net_pnl >= 0
+        if is_profit:
+            next_day_capital = self.base_capital
+            capital_remaining = self.session_capital + day_net_pnl
+        else:
+            next_day_capital = max(0.0, self.session_capital + day_net_pnl)
+            capital_remaining = next_day_capital
+            
+        summary = {
+            "capital_used": capital_used,
+            "day_pnl": day_net_pnl,
+            "is_profit": is_profit,
+            "capital_remaining": capital_remaining,
+            "next_day_capital": next_day_capital,
+            "overall_pnl": self.overall_pnl,
+            "base_capital": self.base_capital
+        }
+        
+        self.session_capital = next_day_capital
+        self.save_state()
+        return summary
+
+
+# ============================================================
 # STOCK TRADER ENGINE
 # ============================================================
 class StockTrader:
     def __init__(self, symbol: str, config: Dict, logger, kite=None,
-                 nfo_df=None, telegram=None, pcr_tracker=None):
+                 nfo_df=None, telegram=None, pcr_tracker=None,
+                 capital_tracker=None, bot_controller=None):
         self.symbol = symbol
         self.config = config
         self.logger = logger
@@ -186,6 +302,8 @@ class StockTrader:
         self.nfo_df = nfo_df
         self.telegram = telegram
         self.pcr_tracker = pcr_tracker
+        self.capital_tracker = capital_tracker
+        self.bot_controller = bot_controller
         
         self.timeframe_minutes = config.get("timeframe", 15)
         self.macd_lookback = config.get("macd_lookback", 3)
@@ -440,6 +558,22 @@ class StockTrader:
             return None
 
     def _enter_position(self, signal_type: str, spot: float, in_gz: bool):
+        # Capital Risk Guardrail Check
+        if self.capital_tracker and self.bot_controller:
+            active_count = sum(1 for t in self.bot_controller.traders.values() if t.position is not None)
+            can_open, reason = self.capital_tracker.can_open_position(active_count)
+            if not can_open:
+                self.logger(f"⚠️ [{self.symbol}] Entry blocked: {reason}")
+                if self.telegram and (self.capital_tracker.session_capital < self.capital_tracker.per_slot_capital or self.capital_tracker.session_capital <= 0):
+                    self.telegram.notify_capital_alert(
+                        self.symbol,
+                        self.capital_tracker.session_capital,
+                        self.capital_tracker.per_slot_capital,
+                        self.capital_tracker.overall_pnl,
+                        reason
+                    )
+                return
+
         opt_type = "CE" if signal_type == "BUY" else "PE"
         contract = self._get_live_atm_contract(spot, opt_type)
         if not contract:
@@ -546,6 +680,7 @@ class StockOptionsBot:
         self.traders: Dict[str, StockTrader] = {}
         self.token_to_symbol: Dict[int, str] = {}
         self.log_file = LOG_DIR / f"stocks_{now_ist().strftime('%Y%m%d')}.log"
+        self.capital_tracker = CapitalTracker(base_capital=TOTAL_CAPITAL, per_slot_capital=PER_STOCK_CAPITAL_LIMIT, logger=self._log)
 
     def _log(self, message: str):
         ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
@@ -611,7 +746,7 @@ class StockOptionsBot:
             if len(strikes) > 1:
                 cfg["strike_gap"] = float(strikes[1] - strikes[0])
                 
-            self.traders[sym] = StockTrader(sym, cfg, self._log, self.kite, self.nfo_df, self.telegram, self.pcr_tracker)
+            self.traders[sym] = StockTrader(sym, cfg, self._log, self.kite, self.nfo_df, self.telegram, self.pcr_tracker, self.capital_tracker, self)
             self._log(f"   ✓ {sym:<10} | Spot Token: {cfg['token']} | Lot Size: {cfg['lot_size']} | Strike Step: {cfg['strike_gap']}")
 
     def fetch_historical_and_gz(self):
@@ -729,11 +864,20 @@ class StockOptionsBot:
             sec_data[sym] = {"trades": len(tr.trades), "pnl": sym_pnl, "wins": sym_wins, "losses": len(tr.trades) - sym_wins}
             
         diagnostics = {s: t.get_diagnostics() for s, t in self.traders.items()}
+        
+        # End of day capital processing
+        cap_summary = self.capital_tracker.end_day(tot_pnl)
+        
         if self.telegram:
-            self.telegram.notify_daily_summary(today, sec_data, tot_pnl, diagnostics=diagnostics)
+            self.telegram.notify_daily_summary(today, sec_data, tot_pnl, diagnostics=diagnostics, capital_summary=cap_summary)
             
         report = {
-            "date": today, "total_capital": TOTAL_CAPITAL, "total_trades": len(all_trades), "net_pnl": tot_pnl, "diagnostics": diagnostics
+            "date": today,
+            "total_capital": TOTAL_CAPITAL,
+            "capital_summary": cap_summary,
+            "total_trades": len(all_trades),
+            "net_pnl": tot_pnl,
+            "diagnostics": diagnostics
         }
         with open(LOG_DIR / f"stocks_report_{today}.json", "w") as f:
             json.dump(report, f, indent=2, default=str)
@@ -741,7 +885,7 @@ class StockOptionsBot:
     def run(self):
         self.is_running = True
         print("\n" + "="*70)
-        print(f"🚀 AUTONOMOUS STOCK OPTIONS BOT (Capital: ₹{TOTAL_CAPITAL:,.0f})")
+        print(f"🚀 AUTONOMOUS STOCK OPTIONS BOT (Capital: ₹{self.capital_tracker.session_capital:,.0f} | Overall P&L: ₹{self.capital_tracker.overall_pnl:+,.0f})")
         print("="*70)
         
         if not self.authenticate(): return
@@ -749,7 +893,7 @@ class StockOptionsBot:
         self.fetch_historical_and_gz()
         
         if self.telegram:
-            self.telegram.notify_bot_start(list(STOCKS.keys()))
+            self.telegram.notify_bot_start(list(STOCKS.keys()), capital_tracker=self.capital_tracker)
             
         self.start_live_feed()
         

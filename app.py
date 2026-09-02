@@ -153,7 +153,7 @@ def run_single_trading_day() -> bool:
     
     try:
         if bot_instance.telegram:
-            bot_instance.telegram.notify_bot_start(list(STOCKS.keys()))
+            bot_instance.telegram.notify_bot_start(list(STOCKS.keys()), capital_tracker=bot_instance.capital_tracker)
             
         bot_instance.start_live_feed()
         

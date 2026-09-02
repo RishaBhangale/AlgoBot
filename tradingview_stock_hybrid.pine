@@ -1,5 +1,5 @@
 //@version=5
-indicator("AGY Stock Hybrid Overlay (SuperTrend + Alligator Golden Zone + ORB)", overlay=true, max_lines_count=500, max_boxes_count=500)
+indicator("AGY Stock Hybrid Overlay (SuperTrend + Alligator Golden Zone + ORB + Risk/Reward Zones)", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
 
 // ==============================================================================
 // 1. INPUT PARAMETERS
@@ -20,6 +20,10 @@ show_gz     = input.bool(true, "Show Fibonacci Golden Zone", group=grp_alli)
 
 grp_orb     = "4. Opening Range Breakout (15M)"
 show_orb    = input.bool(true, "Show 15M ORB Levels (09:15-09:30)", group=grp_orb)
+
+grp_rr      = "5. Risk / Reward Target & Stop-Loss Bands"
+show_rr     = input.bool(true, "Show Green Target & Red Stop-Loss Zones", group=grp_rr)
+rr_ratio    = input.float(1.5, "Risk-to-Reward Target Multiplier", step=0.1, group=grp_rr)
 
 // ==============================================================================
 // 2. INTRADAY VWAP & SUPERTREND
@@ -91,7 +95,7 @@ htf_hl2 = request.security(syminfo.tickerid, htf_tf, hl2, gaps=barmerge.gaps_off
 htf_high = request.security(syminfo.tickerid, htf_tf, high, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 htf_low  = request.security(syminfo.tickerid, htf_tf, low, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 
-// Fractal Highs/Lows on HTF (5-bar fractal)
+// Fractal Highs/Lows on HTF (20-bar window)
 htf_swing_high = request.security(syminfo.tickerid, htf_tf, ta.highest(high, 20), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 htf_swing_low  = request.security(syminfo.tickerid, htf_tf, ta.lowest(low, 20), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 
@@ -147,7 +151,9 @@ bool sell_pe_signal = (sell_score >= 2.0) and is_session_active and not (in_bull
 
 // Position State Tracker
 var string pos_type = "NONE"
+var float pos_entry = na
 var float pos_sl = na
+var float pos_tp = na
 var int pos_lots = 1
 
 bool enter_ce = false
@@ -155,19 +161,59 @@ bool enter_pe = false
 bool exit_trade = false
 string exit_msg = ""
 
+// Risk / Reward Visual Zone Handles
+var box box_tp = na
+var box box_sl = na
+var line line_entry = na
+var line line_tp = na
+var line line_sl = na
+
 if pos_type == "NONE"
     if buy_ce_signal
         pos_type := "CE"
         pos_lots := in_bull_gz ? 2 : 1
+        pos_entry := close
         pos_sl := low[1]
+        // Target: 1.5x Risk-Reward or minimum 1.5% spot expansion
+        float risk_dist = math.max(pos_entry - pos_sl, pos_entry * 0.008)
+        pos_tp := pos_entry + (risk_dist * rr_ratio)
         enter_ce := true
+        
+        if show_rr
+            box_tp := box.new(left=bar_index, top=pos_tp, right=bar_index + 1, bottom=pos_entry, 
+                              bgcolor=color.new(color.green, 85), border_color=color.green, border_style=line.style_solid)
+            box_sl := box.new(left=bar_index, top=pos_entry, right=bar_index + 1, bottom=pos_sl, 
+                              bgcolor=color.new(color.red, 85), border_color=color.red, border_style=line.style_solid)
+            line_entry := line.new(bar_index, pos_entry, bar_index + 1, pos_entry, color=color.gray, width=2, style=line.style_dashed)
+            line_tp    := line.new(bar_index, pos_tp, bar_index + 1, pos_tp, color=color.green, width=2, style=line.style_solid)
+            line_sl    := line.new(bar_index, pos_sl, bar_index + 1, pos_sl, color=color.red, width=2, style=line.style_solid)
+
     else if sell_pe_signal
         pos_type := "PE"
         pos_lots := in_bear_gz ? 2 : 1
+        pos_entry := close
         pos_sl := high[1]
+        float risk_dist = math.max(pos_sl - pos_entry, pos_entry * 0.008)
+        pos_tp := pos_entry - (risk_dist * rr_ratio)
         enter_pe := true
+        
+        if show_rr
+            box_tp := box.new(left=bar_index, top=pos_entry, right=bar_index + 1, bottom=pos_tp, 
+                              bgcolor=color.new(color.green, 85), border_color=color.green, border_style=line.style_solid)
+            box_sl := box.new(left=bar_index, top=pos_sl, right=bar_index + 1, bottom=pos_entry, 
+                              bgcolor=color.new(color.red, 85), border_color=color.red, border_style=line.style_solid)
+            line_entry := line.new(bar_index, pos_entry, bar_index + 1, pos_entry, color=color.gray, width=2, style=line.style_dashed)
+            line_tp    := line.new(bar_index, pos_tp, bar_index + 1, pos_tp, color=color.green, width=2, style=line.style_solid)
+            line_sl    := line.new(bar_index, pos_sl, bar_index + 1, pos_sl, color=color.red, width=2, style=line.style_solid)
 
 else if pos_type == "CE"
+    if show_rr and not na(box_tp)
+        box.set_right(box_tp, bar_index)
+        box.set_right(box_sl, bar_index)
+        line.set_x2(line_entry, bar_index)
+        line.set_x2(line_tp, bar_index)
+        line.set_x2(line_sl, bar_index)
+
     if macd_bear_cross
         exit_trade := true
         exit_msg := "MACD Reversal"
@@ -184,8 +230,19 @@ else if pos_type == "CE"
         exit_trade := true
         exit_msg := "Stop Loss Hit"
         pos_type := "NONE"
+    else if close >= pos_tp
+        exit_trade := true
+        exit_msg := "Target Hit"
+        pos_type := "NONE"
 
 else if pos_type == "PE"
+    if show_rr and not na(box_tp)
+        box.set_right(box_tp, bar_index)
+        box.set_right(box_sl, bar_index)
+        line.set_x2(line_entry, bar_index)
+        line.set_x2(line_tp, bar_index)
+        line.set_x2(line_sl, bar_index)
+
     if macd_bull_cross
         exit_trade := true
         exit_msg := "MACD Reversal"
@@ -201,6 +258,10 @@ else if pos_type == "PE"
     else if close > pos_sl
         exit_trade := true
         exit_msg := "Stop Loss Hit"
+        pos_type := "NONE"
+    else if close <= pos_tp
+        exit_trade := true
+        exit_msg := "Target Hit"
         pos_type := "NONE"
 
 // ==============================================================================
