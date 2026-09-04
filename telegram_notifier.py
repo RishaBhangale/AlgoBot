@@ -85,7 +85,7 @@ class TelegramNotifier:
             overall_sign = "+" if overall_pnl >= 0 else ""
             cap_section = (
                 f"<b>Capital Today:</b> ₹{cap_today:,.2f}\n"
-                f"<b>Overall P&L:</b> ₹{overall_sign}{overall_pnl:,.2f} (Passive Income Tracker)\n"
+                f"<b>Overall P&L:</b> ₹{overall_sign}{overall_pnl:,.2f}\n"
                 f"<b>Max Concurrent Positions:</b> {max_pos} (₹{capital_tracker.per_slot_capital:,.0f}/slot)\n\n"
             )
 
