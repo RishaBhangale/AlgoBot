@@ -5,8 +5,7 @@ Deploys Quad-Confirmation + Alligator Golden Zone Stock Bot on Render free tier.
 
 Features:
 - FastAPI responds to Render & UptimeRobot health checks immediately
-- Autonomous daily trading loop in background thread (08:50 AM to 15:30 PM IST)
-- Built-in keepalive self-pinger to prevent 15-minute Render free-tier sleep
+- Autonomous daily trading loop in background thread (08:50 AM to 15:35 IST)
 - Real-time Telegram alerting on entries, exits, near-misses, and daily EOD summary
 - Strict Capital Management: ₹1,00,000 (₹1.0 Lakh) Total Capital
 """
@@ -62,56 +61,35 @@ def add_log(message: str):
         bot_logs.pop(0)
 
 
-def keepalive_pinger():
-    """Background thread that pings RENDER_EXTERNAL_URL every 8 minutes to prevent Render free-tier sleep."""
-    import requests
-    render_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SELF_PING_URL")
-    if not render_url:
-        add_log("ℹ️ No RENDER_EXTERNAL_URL detected; use UptimeRobot for external pinging if on Render free tier.")
-        return
-        
-    ping_url = render_url.rstrip("/") + "/ping"
-    add_log(f"⏰ Render Keep-Alive self-pinger active: pinging {ping_url} every 8 minutes...")
-    
-    while True:
-        try:
-            time.sleep(480)  # 8 minutes
-            now = now_ist()
-            if now.weekday() < 5 and (8 <= now.hour < 16):
-                r = requests.get(ping_url, timeout=10)
-                if r.status_code == 200:
-                    add_log("💓 Keep-alive self-ping sent to Render router (container awake)")
-        except Exception as e:
-            add_log(f"⚠️ Keep-alive ping warning: {e}")
-
-
 def run_single_trading_day() -> bool:
     """Run a single trading day session."""
     global bot_instance, bot_status
-    
+
     today = now_ist().strftime("%Y-%m-%d")
     bot_status["trading_day"] = today
     bot_status["days_run"] += 1
-    
+
     add_log(f"📅 Starting Stock trading day: {today} (Day #{bot_status['days_run']})")
-    
+
     now = now_ist()
     login_time = now.replace(hour=8, minute=50, second=0, microsecond=0)
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    
+
     # Weekend check
     if now.weekday() >= 5:
+        bot_status["status"] = "sleeping"
         bot_status["market_status"] = "Weekend"
         add_log("📅 Weekend - Market closed")
         return True
-        
-    # After hours check
+
+    # After hours check — clear any stale error status
     if now > market_close:
+        bot_status["status"] = "sleeping"
         bot_status["market_status"] = "After Hours"
         add_log("📅 After market hours - waiting for tomorrow")
         return True
-        
+
     # Wait for login time (8:50 AM)
     if now < login_time:
         mins = int((login_time - now).total_seconds() / 60)
@@ -119,25 +97,25 @@ def run_single_trading_day() -> bool:
         bot_status["status"] = "waiting_for_login_time"
         while now_ist() < login_time:
             time.sleep(60)
-            
+
     # Fresh Authentication
     add_log("🔐 Performing automated Kite Connect login...")
     bot_status["status"] = "authenticating"
-    
+
     bot_instance = StockOptionsBot()
     if not bot_instance.authenticate():
         add_log("❌ Kite authentication failed!")
         bot_status["status"] = "error"
         bot_status["error"] = "Auth failed"
         return False
-        
+
     bot_status["authenticated"] = True
     bot_status["status"] = "waiting_for_market"
-    
+
     # Load metadata (tokens, lot sizes, strike steps)
     bot_instance.load_market_metadata()
     bot_instance.fetch_historical_and_gz()
-    
+
     # Wait for market open
     now = now_ist()
     if now < market_open:
@@ -145,35 +123,35 @@ def run_single_trading_day() -> bool:
         add_log(f"⏳ Waiting {mins} mins for market open at 09:15 AM...")
         while now_ist() < market_open:
             time.sleep(30)
-            
+
     # Start Trading Session
     add_log("📊 Starting Stock Options trading session...")
     bot_status["status"] = "running"
     bot_status["market_status"] = "Market Open"
-    
+
     try:
         if bot_instance.telegram:
             bot_instance.telegram.notify_bot_start(list(STOCKS.keys()), capital_tracker=bot_instance.capital_tracker)
-            
+
         bot_instance.start_live_feed()
-        
+
         heartbeat_sent = False
         eod_summary_sent = False
         pcr_last_updated = None
-        
+
         # Market close time: 15:30 IST. Give 5 extra mins buffer.
         session_end = now_ist().replace(hour=15, minute=35, second=0, microsecond=0)
-        
+
         while now_ist() < session_end:
             now = now_ist()
-            
+
             # 1. Update PCR every 15 mins (only during market hours)
             if bot_instance.is_market_open():
                 if pcr_last_updated is None or (now - pcr_last_updated).total_seconds() >= 900:
                     for sym in STOCKS.keys():
                         bot_instance.pcr_tracker.update_stock_pcr(sym, bot_instance.nfo_df)
                     pcr_last_updated = now
-                
+
             # 2. Mid-Day Heartbeat at 12:00 PM IST (fires once)
             if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
                 if bot_instance.telegram:
@@ -183,10 +161,11 @@ def run_single_trading_day() -> bool:
                     bot_instance.telegram.notify_midday_heartbeat(status_dict, total_ticks, active_pos)
                 heartbeat_sent = True
 
-            # 3. Tick-Starvation Watchdog — restart WebSocket if no ticks for 5 mins during market hours
+            # 3. Tick-Starvation Watchdog — only fires after FIRST real tick arrives,
+            #    then restarts if >5 mins of silence during market hours
             if bot_instance.is_market_open():
                 last_tick = getattr(bot_instance, "_last_tick_time", None)
-                if last_tick and (now - last_tick).total_seconds() > 300:
+                if last_tick is not None and (now - last_tick).total_seconds() > 300:
                     add_log("⚠️ No ticks for 5+ minutes during market hours — restarting WebSocket feed...")
                     try:
                         bot_instance._restart_ticker()
@@ -202,9 +181,9 @@ def run_single_trading_day() -> bool:
                     eod_summary_sent = True
                 except Exception as eod_err:
                     add_log(f"⚠️ EOD summary error: {eod_err}")
-                
+
             time.sleep(5)
-            
+
         add_log("🏁 Market session window closed.")
         # Ensure EOD summary fires even if 15:31 trigger was missed
         if not eod_summary_sent:
@@ -213,7 +192,7 @@ def run_single_trading_day() -> bool:
         bot_status["status"] = "day_complete"
         bot_status["market_status"] = "Market Closed"
         return True
-        
+
     except Exception as e:
         add_log(f"❌ Session error: {e}")
         traceback.print_exc()
@@ -233,25 +212,29 @@ def run_single_trading_day() -> bool:
 def run_trading_bot():
     """Main daemon loop running day after day."""
     add_log("🚀 Stock Options Bot Daemon started.")
-    
+
     while True:
         try:
             success = run_single_trading_day()
             if not success:
                 add_log("⚠️ Session failed. Retrying in 15 minutes...")
+                bot_status["status"] = "error_retry"
                 time.sleep(900)
+                # After retry wait, clear the error status before attempting next day
+                bot_status["status"] = "sleeping"
+                bot_status["error"] = None
                 continue
-                
+
             add_log("💤 Session complete. Sleeping until 08:45 AM tomorrow...")
+            bot_status["status"] = "sleeping"
             next_morning = (now_ist() + timedelta(days=1)).replace(hour=8, minute=45, second=0)
             while now_ist() < next_morning:
-                if now_ist().weekday() >= 5:
-                    break
                 time.sleep(300)
-                
+
         except Exception as e:
             add_log(f"❌ Daemon loop error: {e}")
             traceback.print_exc()
+            bot_status["status"] = "sleeping"
             time.sleep(60)
 
 
@@ -270,8 +253,6 @@ def start_bot_thread():
 async def lifespan(app: FastAPI):
     add_log("🌐 FastAPI initializing...")
     start_bot_thread()
-    pinger = threading.Thread(target=keepalive_pinger, name="KeepAlivePinger", daemon=True)
-    pinger.start()
     yield
     add_log("🛑 FastAPI shutting down...")
 
@@ -279,7 +260,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stock Options Momentum Bot",
     description="Quad-Confirmation + Alligator Golden Zone - Autonomous Daily Runner",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan
 )
 
@@ -290,7 +271,8 @@ async def root():
     bot_status["last_health_check"] = now_ist().isoformat()
     st = bot_status.get("status", "unknown")
     day = bot_status.get("trading_day", "N/A")
-    return f"Stock Bot: {st} | Day: {day} | Capital: ₹{TOTAL_CAPITAL:,.0f}"
+    cap = bot_instance.capital_tracker.session_capital if bot_instance and hasattr(bot_instance, "capital_tracker") else TOTAL_CAPITAL
+    return f"Stock Bot: {st} | Day: {day} | Capital: ₹{cap:,.0f}"
 
 
 @app.get("/ping", response_class=PlainTextResponse)

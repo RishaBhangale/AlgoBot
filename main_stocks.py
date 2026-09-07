@@ -860,7 +860,7 @@ class StockOptionsBot:
         creds = load_credentials()
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
         tokens = list(self.token_to_symbol.keys())
-        self._last_tick_time = now_ist()
+        self._last_tick_time = None  # Set only when first real tick arrives
         
         def on_connect(ws, resp):
             ws.subscribe(tokens)
