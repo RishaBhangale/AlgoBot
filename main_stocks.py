@@ -860,13 +860,15 @@ class StockOptionsBot:
         creds = load_credentials()
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
         tokens = list(self.token_to_symbol.keys())
+        self._last_tick_time = now_ist()
         
         def on_connect(ws, resp):
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
-            self._log(f"✅ Live WebSocket subscribed to {len(tokens)} stocks.")
+            self._log(f"✅ WebSocket connected — subscribed to {len(tokens)} stock tokens.")
             
         def on_ticks(ws, ticks):
+            self._last_tick_time = now_ist()
             for t in ticks:
                 tok = t.get("instrument_token")
                 if tok in self.token_to_symbol:
@@ -875,10 +877,44 @@ class StockOptionsBot:
                     vol = t.get("volume_traded", 0)
                     if ltp and sym in self.traders:
                         self.traders[sym].process_tick(ltp, now_ist(), vol)
-                        
+
+        def on_error(ws, code, reason):
+            self._log(f"⚠️ WebSocket error [{code}]: {reason} — will attempt reconnect.")
+
+        def on_close(ws, code, reason):
+            self._log(f"⚠️ WebSocket closed [{code}]: {reason}.")
+            # KiteTicker with reconnect=True will auto-retry; log it so we know
+            if self.is_running and self.is_market_open():
+                self._log("🔄 Market is open — waiting for KiteTicker auto-reconnect...")
+
+        def on_reconnect(ws, attempt):
+            self._log(f"🔄 WebSocket reconnecting... attempt #{attempt}")
+
+        def on_noreconnect(ws):
+            self._log("❌ WebSocket exhausted all reconnect attempts — restarting ticker now.")
+            try:
+                self._restart_ticker()
+            except Exception as e:
+                self._log(f"❌ Ticker restart failed: {e}")
+
         self.ticker.on_connect = on_connect
         self.ticker.on_ticks = on_ticks
+        self.ticker.on_error = on_error
+        self.ticker.on_close = on_close
+        self.ticker.on_reconnect = on_reconnect
+        self.ticker.on_noreconnect = on_noreconnect
         self.ticker.connect(threaded=True)
+
+    def _restart_ticker(self):
+        """Hard-restart the KiteTicker when auto-reconnect is exhausted."""
+        try:
+            if self.ticker:
+                self.ticker.close()
+        except Exception:
+            pass
+        time.sleep(5)
+        self.start_live_feed()
+        self._log("✅ WebSocket ticker restarted successfully.")
 
     def is_market_open(self) -> bool:
         now = now_ist()
