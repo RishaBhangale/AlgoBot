@@ -861,10 +861,11 @@ class StockOptionsBot:
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
         tokens = list(self.token_to_symbol.keys())
         self._last_tick_time = None  # Set only when first real tick arrives
-        
+
         def on_connect(ws, resp):
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
+            self._feed_start_time = now_ist()  # Mark when feed actually connected
             self._log(f"✅ WebSocket connected — subscribed to {len(tokens)} stock tokens.")
             
         def on_ticks(ws, ticks):
