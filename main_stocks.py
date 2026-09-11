@@ -47,6 +47,7 @@ except ImportError:
     TelegramNotifier = None
 
 from auto_login import KiteAutoLogin, load_credentials
+from execution_engine import ExecutionEngine
 
 # ============================================================
 # CONFIGURATION & CAPITAL ALLOCATION (₹1.0 LAKH)
@@ -189,9 +190,11 @@ class CapitalTracker:
         self.per_slot_capital = per_slot_capital
         self.state_file = state_file
         self.logger = logger
+        self.lock = Lock()  # Thread safety for concurrent trader access
         
         self.session_capital = self.base_capital
         self.overall_pnl = 0.0
+        self.daily_realized_pnl = 0.0  # Track intraday P&L for daily loss limit
         self.load_state()
 
     def load_state(self):
@@ -244,11 +247,18 @@ class CapitalTracker:
     def _push_to_render_env(self):
         """Persist SESSION_CAPITAL and OVERALL_PNL as Render env vars so they
         survive container teardowns and new deployments.
-        Uses per-key PUT to avoid wiping other env vars."""
+        Uses GET-merge-PUT pattern to preserve all existing env vars."""
+        import math
         api_key = os.environ.get("RENDER_API_KEY")
         service_id = os.environ.get("RENDER_SERVICE_ID")
         if not api_key or not service_id:
             return  # Not on Render or keys not configured — silently skip
+        
+        # Guard against persisting NaN or Inf
+        if not math.isfinite(self.session_capital) or not math.isfinite(self.overall_pnl):
+            self.logger("⚠️ Refusing to persist non-finite capital values to Render")
+            return
+        
         try:
             import urllib.request
             base_url = f"https://api.render.com/v1/services/{service_id}/env-vars"
@@ -257,15 +267,25 @@ class CapitalTracker:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
-            # Update each key individually — does NOT touch other env vars
-            for key, value in [("SESSION_CAPITAL", str(self.session_capital)),
-                               ("OVERALL_PNL", str(self.overall_pnl))]:
-                payload = json.dumps({"value": value}).encode()
-                req = urllib.request.Request(
-                    f"{base_url}/{key}", data=payload, method="PUT",
-                    headers=headers
-                )
-                urllib.request.urlopen(req, timeout=10)
+            
+            # 1. GET all existing env vars
+            get_req = urllib.request.Request(base_url, method="GET", headers=headers)
+            with urllib.request.urlopen(get_req, timeout=10) as resp:
+                existing = json.loads(resp.read().decode())
+            
+            # 2. Build env var dict from existing, update our keys
+            env_dict = {}
+            for item in existing:
+                env_dict[item["envVar"]["key"]] = item["envVar"]["value"]
+            
+            env_dict["SESSION_CAPITAL"] = str(self.session_capital)
+            env_dict["OVERALL_PNL"] = str(self.overall_pnl)
+            
+            # 3. PUT full list back (preserves KITE_*, TELEGRAM_*, etc.)
+            payload = json.dumps([{"key": k, "value": v} for k, v in env_dict.items()]).encode()
+            put_req = urllib.request.Request(base_url, data=payload, method="PUT", headers=headers)
+            urllib.request.urlopen(put_req, timeout=10)
+            
             self.logger(f"💾 Capital persisted to Render — Session: ₹{self.session_capital:,.2f} | P&L: ₹{self.overall_pnl:+,.2f}")
         except Exception as e:
             self.logger(f"⚠️ Could not push capital to Render env vars: {e}")
@@ -276,14 +296,23 @@ class CapitalTracker:
         return min(MAX_CONCURRENT_POSITIONS, int(self.session_capital // self.per_slot_capital))
 
     def can_open_position(self, current_open_count: int) -> tuple:
-        if self.session_capital <= 0:
-            return False, "Session capital is zero or depleted. Trading halted."
-        if self.session_capital < self.per_slot_capital:
-            return False, f"Session capital (₹{self.session_capital:,.2f}) is below minimum required per-slot capital (₹{self.per_slot_capital:,.2f})."
-        max_allowed = self.get_max_concurrent_positions()
-        if current_open_count >= max_allowed:
-            return False, f"Maximum concurrent positions reached ({current_open_count}/{max_allowed}) for capital ₹{self.session_capital:,.2f}."
-        return True, "OK"
+        with self.lock:
+            if self.session_capital <= 0:
+                return False, "Session capital is zero or depleted. Trading halted."
+            # Daily loss limit circuit breaker
+            if self.daily_realized_pnl <= -DAILY_LOSS_LIMIT:
+                return False, f"Daily loss limit hit: ₹{self.daily_realized_pnl:,.2f} exceeds -₹{DAILY_LOSS_LIMIT:,.2f}. Trading halted for today."
+            if self.session_capital < self.per_slot_capital:
+                return False, f"Session capital (₹{self.session_capital:,.2f}) is below minimum required per-slot capital (₹{self.per_slot_capital:,.2f})."
+            max_allowed = self.get_max_concurrent_positions()
+            if current_open_count >= max_allowed:
+                return False, f"Maximum concurrent positions reached ({current_open_count}/{max_allowed}) for capital ₹{self.session_capital:,.2f}."
+            return True, "OK"
+    
+    def record_trade_pnl(self, pnl: float):
+        """Record a closed trade's P&L for daily loss limit tracking."""
+        with self.lock:
+            self.daily_realized_pnl += pnl
 
     def end_day(self, day_net_pnl: float) -> dict:
         """
@@ -327,7 +356,7 @@ class CapitalTracker:
 class StockTrader:
     def __init__(self, symbol: str, config: Dict, logger, kite=None,
                  nfo_df=None, telegram=None, pcr_tracker=None,
-                 capital_tracker=None, bot_controller=None):
+                 capital_tracker=None, bot_controller=None, execution_engine=None):
         self.symbol = symbol
         self.config = config
         self.logger = logger
@@ -337,6 +366,7 @@ class StockTrader:
         self.pcr_tracker = pcr_tracker
         self.capital_tracker = capital_tracker
         self.bot_controller = bot_controller
+        self.execution_engine = execution_engine
         
         self.timeframe_minutes = config.get("timeframe", 15)
         self.macd_lookback = config.get("macd_lookback", 3)
@@ -352,6 +382,15 @@ class StockTrader:
         self.vwap = 0.0
         self.pending_macd_bullish = 0
         self.pending_macd_bearish = 0
+        
+        # SuperTrend recursive state (proper trailing bands)
+        self.prev_final_ub = None
+        self.prev_final_lb = None
+        self.prev_st_trend = 0  # 1=up, -1=down, 0=uninitialized
+        self.prev_close_for_st = None
+        
+        # VWAP incremental volume tracking
+        self.prev_cumulative_volume = 0
         
         # Alligator Golden Zone (75M)
         self.gz_bull_top = None
@@ -372,31 +411,49 @@ class StockTrader:
         self.last_near_miss_notified = None
         self.primary_block_reason = "No confirmed MACD crossover formed"
         self.lock = Lock()
+        self.last_option_ltp = 0.0  # Updated from WebSocket ticks for SL monitoring
 
     def process_tick(self, ltp: float, tick_time: datetime, volume: int = 0):
         with self.lock:
             self.tick_count += 1
             self.ltp = ltp
             
-            candle_min = (tick_time.minute // self.timeframe_minutes) * self.timeframe_minutes
-            candle_ts = tick_time.replace(minute=candle_min, second=0, microsecond=0)
+            # Compute incremental volume from Kite's cumulative volume_traded
+            incremental_vol = max(0, volume - self.prev_cumulative_volume) if volume > 0 else 0
+            self.prev_cumulative_volume = volume if volume > 0 else self.prev_cumulative_volume
+            
+            # Session-anchored candle alignment (09:15 open anchor, handles 15m & 30m)
+            total_mins = tick_time.hour * 60 + tick_time.minute
+            market_open_mins = 9 * 60 + 15
+            if total_mins >= market_open_mins:
+                elapsed = total_mins - market_open_mins
+                bucket_start_mins = market_open_mins + (elapsed // self.timeframe_minutes) * self.timeframe_minutes
+                c_hour = bucket_start_mins // 60
+                c_min = bucket_start_mins % 60
+                candle_ts = tick_time.replace(hour=c_hour, minute=c_min, second=0, microsecond=0)
+            else:
+                candle_min = (tick_time.minute // self.timeframe_minutes) * self.timeframe_minutes
+                candle_ts = tick_time.replace(minute=candle_min, second=0, microsecond=0)
             
             if self.current_candle is None or candle_ts != self.last_candle_time:
                 if self.current_candle:
                     self.candles.append(self.current_candle)
                     self.candle_count += 1
+                    # Truncate candle list to prevent memory growth
+                    if len(self.candles) > 120:
+                        self.candles = self.candles[-100:]
                     if len(self.candles) >= ATR_PERIOD + 5:
                         self._process_candle(self.current_candle)
                 
                 self.current_candle = {
-                    "timestamp": candle_ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": volume
+                    "timestamp": candle_ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": incremental_vol
                 }
                 self.last_candle_time = candle_ts
             else:
                 self.current_candle["high"] = max(self.current_candle["high"], ltp)
                 self.current_candle["low"] = min(self.current_candle["low"], ltp)
                 self.current_candle["close"] = ltp
-                self.current_candle["volume"] += volume
+                self.current_candle["volume"] += incremental_vol
                 
             # Real-time tick SL check
             if self.position:
@@ -410,22 +467,52 @@ class StockTrader:
         # 1. Calculate Technical Indicators on Closed Candle
         df = pd.DataFrame(self.candles[-60:])
         
-        # SuperTrend (20, 2)
+        # SuperTrend (20, 2) — Proper Recursive Trailing Bands
         hl = df['high'] - df['low']
         hc = (df['high'] - df['close'].shift(1)).abs()
         lc = (df['low'] - df['close'].shift(1)).abs()
         tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
         atr = tr.ewm(span=ATR_PERIOD, adjust=False).mean().iloc[-1]
         
-        hl2 = (df['high'] + df['low']) / 2
-        basic_ub = hl2 + (ATR_MULTIPLIER * atr)
-        basic_lb = hl2 - (ATR_MULTIPLIER * atr)
-        self.supertrend_value = basic_lb.iloc[-1] if c_close >= df['close'].iloc[-2] else basic_ub.iloc[-1]
-        st_bullish = c_close > self.supertrend_value
-        st_bearish = c_close < self.supertrend_value
+        hl2_val = (candle['high'] + candle['low']) / 2
+        basic_ub = hl2_val + (ATR_MULTIPLIER * atr)
+        basic_lb = hl2_val - (ATR_MULTIPLIER * atr)
+        
+        # Recursive trailing: bands only tighten, never widen against the trend
+        prev_close = self.prev_close_for_st
+        if self.prev_final_ub is not None and prev_close is not None:
+            final_ub = min(basic_ub, self.prev_final_ub) if prev_close <= self.prev_final_ub else basic_ub
+            final_lb = max(basic_lb, self.prev_final_lb) if prev_close >= self.prev_final_lb else basic_lb
+        else:
+            final_ub = basic_ub
+            final_lb = basic_lb
+        
+        # Determine trend: only flip when price crosses through the trailing band
+        if self.prev_st_trend == 1:  # Was uptrend (using lower band)
+            if c_close < final_lb:
+                st_trend = -1  # Flip to downtrend
+            else:
+                st_trend = 1   # Stay uptrend
+        elif self.prev_st_trend == -1:  # Was downtrend (using upper band)
+            if c_close > final_ub:
+                st_trend = 1   # Flip to uptrend
+            else:
+                st_trend = -1  # Stay downtrend
+        else:
+            # First candle — initialize based on price vs bands
+            st_trend = 1 if c_close > final_ub else -1
+        
+        self.supertrend_value = final_lb if st_trend == 1 else final_ub
+        st_bullish = (st_trend == 1)
+        st_bearish = (st_trend == -1)
+        
+        # Save state for next candle's recursion
+        self.prev_final_ub = final_ub
+        self.prev_final_lb = final_lb
+        self.prev_close_for_st = c_close
         
         prev_trend = self.current_trend
-        self.current_trend = 1 if st_bullish else (-1 if st_bearish else 0)
+        self.current_trend = st_trend
         st_bull_flip = (prev_trend != 1 and self.current_trend == 1)
         st_bear_flip = (prev_trend != -1 and self.current_trend == -1)
         
@@ -438,12 +525,24 @@ class StockTrader:
         macd_bull_cross = (macd_line.iloc[-1] > signal_line.iloc[-1]) and (macd_line.iloc[-2] <= signal_line.iloc[-2])
         macd_bear_cross = (macd_line.iloc[-1] < signal_line.iloc[-1]) and (macd_line.iloc[-2] >= signal_line.iloc[-2])
         
-        if macd_bull_cross: self.pending_macd_bullish = self.macd_lookback
-        if macd_bear_cross: self.pending_macd_bearish = self.macd_lookback
+        # Clear opposite pending on new cross (1D fix)
+        if macd_bull_cross:
+            self.pending_macd_bullish = self.macd_lookback
+            self.pending_macd_bearish = 0
+        if macd_bear_cross:
+            self.pending_macd_bearish = self.macd_lookback
+            self.pending_macd_bullish = 0
         
-        # VWAP
-        df['vol_p'] = df['close'] * df['volume']
-        self.vwap = (df['vol_p'].sum() / df['volume'].sum()) if df['volume'].sum() > 0 else c_close
+        # VWAP — Daily reset: only use today's candles
+        today_date = c_ts.date() if hasattr(c_ts, 'date') else c_ts
+        today_candles = [c for c in self.candles[-60:] if hasattr(c['timestamp'], 'date') and c['timestamp'].date() == today_date]
+        if today_candles:
+            df_today = pd.DataFrame(today_candles)
+            df_today['vol_p'] = df_today['close'] * df_today['volume']
+            total_vol = df_today['volume'].sum()
+            self.vwap = (df_today['vol_p'].sum() / total_vol) if total_vol > 0 else c_close
+        else:
+            self.vwap = c_close
         
         # PCR from live Kite Tracker
         pcr = self.pcr_tracker.get_pcr(self.symbol) if self.pcr_tracker else 1.0
@@ -581,7 +680,9 @@ class StockTrader:
             # Fetch live market quote from Kite API
             quote = self.kite.ltp([f"NFO:{tsym}"])
             live_price = quote.get(f"NFO:{tsym}", {}).get("last_price", 0.0)
-            if live_price <= 0: live_price = 25.0  # Safe fallback if market closed
+            if live_price <= 0:
+                self.logger(f"⚠️ [{self.symbol}] LTP unavailable for {tsym} — aborting entry (refusing to fabricate price)")
+                return None
             
             return {
                 "tradingsymbol": tsym, "token": token, "lot_size": lot, "strike": atm_strike, "live_ltp": live_price
@@ -619,6 +720,31 @@ class StockTrader:
         lot_mult = 2 if in_gz else 1
         qty = contract["lot_size"] * lot_mult
         
+        # Trade cost validation — qty × premium must not exceed session capital
+        if self.capital_tracker:
+            trade_cost = qty * entry_price
+            if trade_cost > self.capital_tracker.session_capital:
+                # Try reducing to 1 lot if GZ doubled
+                if lot_mult == 2:
+                    qty = contract["lot_size"]
+                    trade_cost = qty * entry_price
+                    lot_mult = 1
+                    self.logger(f"⚠️ [{self.symbol}] GZ 2-lot (₹{qty * entry_price * 2:,.0f}) exceeds capital — reduced to 1 lot")
+                if trade_cost > self.capital_tracker.session_capital:
+                    self.logger(f"⚠️ [{self.symbol}] Trade cost ₹{trade_cost:,.0f} exceeds session capital ₹{self.capital_tracker.session_capital:,.0f} — entry blocked")
+                    return
+        
+        # Execute via ExecutionEngine (paper or live)
+        if self.execution_engine:
+            result = self.execution_engine.place_entry_order(
+                contract["tradingsymbol"], qty, entry_price, "BUY"
+            )
+            if result["status"] != "COMPLETE":
+                self.logger(f"❌ [{self.symbol}] Entry order failed: {result.get('error', result['status'])}")
+                return
+            entry_price = result["fill_price"]  # Use actual fill price
+            qty = result.get("fill_qty", qty)
+        
         self.position = Position(
             symbol=self.symbol,
             option_type=opt_type,
@@ -632,8 +758,19 @@ class StockTrader:
             spot_at_entry=spot
         )
         
+        # Subscribe option token to WebSocket for real-time SL monitoring
+        self.last_option_ltp = entry_price
+        if self.bot_controller and self.bot_controller.ticker:
+            try:
+                self.bot_controller.ticker.subscribe([contract["token"]])
+                self.bot_controller.ticker.set_mode(self.bot_controller.ticker.MODE_FULL, [contract["token"]])
+                self.bot_controller.token_to_symbol[contract["token"]] = f"OPT_{self.symbol}"
+                self.logger(f"📡 Subscribed option token {contract['token']} ({contract['tradingsymbol']}) to WebSocket")
+            except Exception as e:
+                self.logger(f"⚠️ Failed to subscribe option token: {e}")
+        
         emoji = "🟢" if signal_type == "BUY" else "🔴"
-        gz_tag = "2 LOTS (Golden Zone Confluence)" if in_gz else "1 LOT (Standard)"
+        gz_tag = "2 LOTS (Golden Zone Confluence)" if in_gz and lot_mult == 2 else "1 LOT (Standard)"
         print(f"\n{'='*60}", flush=True)
         print(f"{emoji} [{self.symbol} ENTRY] {contract['tradingsymbol']} | {gz_tag}", flush=True)
         print(f"   Entry LTP: ₹{entry_price:.2f} | Stop-Loss: ₹{sl:.2f} | Quantity: {qty}", flush=True)
@@ -645,28 +782,57 @@ class StockTrader:
             )
 
     def _check_exit(self, current_spot: float):
-        """Tick SL check using live option quote."""
+        """Tick SL check using WebSocket-fed option LTP (no blocking REST calls)."""
         if not self.position: return
-        try:
-            # Query real option quote
-            quote = self.kite.ltp([f"NFO:{self.position.tradingsymbol}"])
-            current_opt_ltp = quote.get(f"NFO:{self.position.tradingsymbol}", {}).get("last_price", 0.0)
-            if current_opt_ltp > 0 and current_opt_ltp <= self.position.sl:
-                self._close_position("SL_HIT", current_opt_ltp)
-        except Exception:
-            pass
+        # Use last option LTP from WebSocket feed (updated in on_ticks)
+        current_opt_ltp = getattr(self, 'last_option_ltp', 0.0)
+        if current_opt_ltp > 0 and current_opt_ltp <= self.position.sl:
+            self.logger(f"🔔 [{self.symbol}] SL triggered: Option LTP ₹{current_opt_ltp:.2f} ≤ SL ₹{self.position.sl:.2f}")
+            self._close_position("SL_HIT", current_opt_ltp)
 
     def _close_position(self, reason: str, exit_price: float = None):
         if not self.position: return
+        
+        # Get exit price with retry + WebSocket fallback
         if exit_price is None or exit_price <= 0:
-            try:
-                quote = self.kite.ltp([f"NFO:{self.position.tradingsymbol}"])
-                exit_price = quote.get(f"NFO:{self.position.tradingsymbol}", {}).get("last_price", self.position.entry_price)
-            except Exception:
-                exit_price = self.position.entry_price
-                
+            # Try REST with retries
+            for attempt in range(3):
+                try:
+                    quote = self.kite.ltp([f"NFO:{self.position.tradingsymbol}"])
+                    fetched = quote.get(f"NFO:{self.position.tradingsymbol}", {}).get("last_price", 0.0)
+                    if fetched > 0:
+                        exit_price = fetched
+                        break
+                except Exception as e:
+                    self.logger(f"⚠️ Exit quote retry {attempt+1}/3 failed: {e}")
+                    if attempt < 2:
+                        time.sleep(0.5)
+            
+            # WebSocket LTP fallback
+            if exit_price is None or exit_price <= 0:
+                ws_ltp = getattr(self, 'last_option_ltp', 0.0)
+                if ws_ltp > 0:
+                    exit_price = ws_ltp
+                    self.logger(f"⚠️ [{self.symbol}] Using WebSocket LTP ₹{ws_ltp:.2f} for exit (REST unavailable)")
+                else:
+                    # Absolute last resort — log warning, use entry price
+                    exit_price = self.position.entry_price
+                    self.logger(f"⚠️ [{self.symbol}] EXIT PRICE UNAVAILABLE — using entry price ₹{exit_price:.2f} (P&L may be inaccurate)")
+        
+        # Execute exit via ExecutionEngine
+        if self.execution_engine:
+            result = self.execution_engine.place_exit_order(
+                self.position.tradingsymbol, self.position.quantity, "SELL", exit_price
+            )
+            if result["status"] == "COMPLETE" and result["fill_price"] > 0:
+                exit_price = result["fill_price"]
+        
         self.position.close(exit_price, reason)
         self.trades.append(self.position)
+        
+        # Record to capital tracker for daily loss limit
+        if self.capital_tracker:
+            self.capital_tracker.record_trade_pnl(self.position.net_pnl)
         
         emoji = "✅" if self.position.net_pnl > 0 else "🛑"
         print(f"\n{emoji} [{self.symbol} EXIT] {self.position.tradingsymbol} - {reason}", flush=True)
@@ -678,7 +844,18 @@ class StockTrader:
                 self.symbol, self.position.option_type, self.position.strike,
                 self.position.entry_price, exit_price, self.position.net_pnl, reason
             )
+        
+        # Unsubscribe option token from WebSocket
+        if self.bot_controller and self.bot_controller.ticker and self.position:
+            try:
+                opt_token = self.position.option_token
+                self.bot_controller.ticker.unsubscribe([opt_token])
+                self.bot_controller.token_to_symbol.pop(opt_token, None)
+            except Exception:
+                pass
+        
         self.position = None
+        self.last_option_ltp = 0.0
 
     def get_diagnostics(self) -> Dict:
         st_state = "BULLISH" if (self.supertrend_value > 0 and self.ltp > self.supertrend_value) else ("BEARISH" if (self.supertrend_value > 0 and self.ltp < self.supertrend_value) else "NEUTRAL")
@@ -714,6 +891,8 @@ class StockOptionsBot:
         self.token_to_symbol: Dict[int, str] = {}
         self.log_file = LOG_DIR / f"stocks_{now_ist().strftime('%Y%m%d')}.log"
         self.capital_tracker = CapitalTracker(base_capital=TOTAL_CAPITAL, per_slot_capital=PER_STOCK_CAPITAL_LIMIT, logger=self._log)
+        self.execution_engine = ExecutionEngine(paper_trading=PAPER_TRADING, logger=self._log)
+        self._needs_restart = False  # Flag for safe WebSocket restart (avoids deadlock)
 
     def _log(self, message: str):
         ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
@@ -737,12 +916,14 @@ class StockOptionsBot:
             try:
                 prof = self.kite.profile()
                 self._log(f"✅ Reusing valid access token. Logged in as: {prof.get('user_name')}")
+                self.execution_engine.kite = self.kite
                 return True
             except Exception:
                 pass
         token = auto_login.login()
         if token:
             self.kite = auto_login.kite
+            self.execution_engine.kite = self.kite
             self._log("✅ Fresh auto-login successful!")
             return True
         return False
@@ -779,7 +960,7 @@ class StockOptionsBot:
             if len(strikes) > 1:
                 cfg["strike_gap"] = float(strikes[1] - strikes[0])
                 
-            self.traders[sym] = StockTrader(sym, cfg, self._log, self.kite, self.nfo_df, self.telegram, self.pcr_tracker, self.capital_tracker, self)
+            self.traders[sym] = StockTrader(sym, cfg, self._log, self.kite, self.nfo_df, self.telegram, self.pcr_tracker, self.capital_tracker, self, self.execution_engine)
             self._log(f"   ✓ {sym:<10} | Spot Token: {cfg['token']} | Lot Size: {cfg['lot_size']} | Strike Step: {cfg['strike_gap']}")
 
     def fetch_historical_and_gz(self):
@@ -804,6 +985,7 @@ class StockOptionsBot:
             # 1. Fetch intraday candles for indicator warm-up
             try:
                 data = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval=interval)
+                trader.candles = []  # Clear previous candles to prevent duplicates on retry
                 for c in data[-50:]:
                     trader.candles.append({
                         "timestamp": c["date"], "open": c["open"], "high": c["high"],
@@ -811,49 +993,61 @@ class StockOptionsBot:
                     })
             except Exception as e:
                 self._log(f"⚠️ Historical candle fetch failed for {sym}: {e}")
+            
+            time.sleep(0.5)  # Rate limit: Kite allows 3 req/sec for historical
 
             # 2. Synthesize 75-minute candles from 15-minute data
             # Group every 5 consecutive 15-minute candles → 1 synthetic 75-minute candle
+            # Session-anchored: only group within same trading day (09:15–15:30)
             try:
                 d15 = self.kite.historical_data(token, from_date=from_d, to_date=to_d, interval="15minute")
                 df15 = pd.DataFrame(d15)
 
                 if not df15.empty and len(df15) >= 5:
-                    # Only use candles from completed 75-min blocks (multiples of 5)
-                    n_complete = (len(df15) // 5) * 5
-                    df15 = df15.iloc[-n_complete:].reset_index(drop=True)
-
-                    # Build synthetic 75-min OHLCV by grouping every 5 rows
+                    # Filter to market hours only (09:15–15:30) to avoid overnight contamination
+                    df15['date_col'] = df15['date'].apply(lambda x: x.date() if hasattr(x, 'date') else x)
+                    df15['time_col'] = df15['date'].apply(lambda x: x.time() if hasattr(x, 'time') else None)
+                    market_open = datetime.strptime("09:15", "%H:%M").time()
+                    market_close = datetime.strptime("15:30", "%H:%M").time()
+                    df15 = df15[(df15['time_col'] >= market_open) & (df15['time_col'] < market_close)]
+                    
+                    # Group by trading day, then within each day group consecutive 5 candles
                     groups = []
-                    for i in range(0, len(df15), 5):
-                        block = df15.iloc[i:i+5]
-                        if len(block) == 5:
-                            groups.append({
-                                "open":  block['open'].iloc[0],
-                                "high":  block['high'].max(),
-                                "low":   block['low'].min(),
-                                "close": block['close'].iloc[-1],
-                            })
+                    for day_date, day_df in df15.groupby('date_col'):
+                        day_df = day_df.reset_index(drop=True)
+                        n_complete = (len(day_df) // 5) * 5
+                        for i in range(0, n_complete, 5):
+                            block = day_df.iloc[i:i+5]
+                            if len(block) == 5:
+                                groups.append({
+                                    "open":  block['open'].iloc[0],
+                                    "high":  block['high'].max(),
+                                    "low":   block['low'].min(),
+                                    "close": block['close'].iloc[-1],
+                                })
 
                     df75 = pd.DataFrame(groups)
 
-                    # Use last 20 synthetic candles (20 × 75min = ~4 trading days)
-                    lookback = df75.iloc[-20:]
-                    p_high = lookback['high'].max()
-                    p_low  = lookback['low'].min()
-                    rng    = p_high - p_low
+                    if not df75.empty:
+                        # Use last 20 synthetic candles (20 × 75min = ~4 trading days)
+                        lookback = df75.iloc[-20:]
+                        p_high = lookback['high'].max()
+                        p_low  = lookback['low'].min()
+                        rng    = p_high - p_low
 
-                    trader.gz_bull_bot = p_low  + (0.50 * rng)
-                    trader.gz_bull_top = p_low  + (0.65 * rng)
-                    trader.gz_bear_top = p_high - (0.50 * rng)
-                    trader.gz_bear_bot = p_high - (0.65 * rng)
-                    self._log(
-                        f"   {sym} 75M GZ: Bull [{trader.gz_bull_bot:.1f}–{trader.gz_bull_top:.1f}]"
-                        f" | Bear [{trader.gz_bear_bot:.1f}–{trader.gz_bear_top:.1f}]"
-                        f"  (built from {len(df75)} synthetic 75M candles)"
-                    )
+                        trader.gz_bull_bot = p_low  + (0.50 * rng)
+                        trader.gz_bull_top = p_low  + (0.65 * rng)
+                        trader.gz_bear_top = p_high - (0.50 * rng)
+                        trader.gz_bear_bot = p_high - (0.65 * rng)
+                        self._log(
+                            f"   {sym} 75M GZ: Bull [{trader.gz_bull_bot:.1f}–{trader.gz_bull_top:.1f}]"
+                            f" | Bear [{trader.gz_bear_bot:.1f}–{trader.gz_bear_top:.1f}]"
+                            f"  (built from {len(df75)} session-anchored 75M candles)"
+                        )
             except Exception as e:
                 self._log(f"⚠️ 75M GZ skipped for {sym}: {e} (GZ boost disabled today)")
+            
+            time.sleep(0.5)  # Rate limit between stocks
 
     def start_live_feed(self):
         creds = load_credentials()
@@ -872,11 +1066,18 @@ class StockOptionsBot:
             for t in ticks:
                 tok = t.get("instrument_token")
                 if tok in self.token_to_symbol:
-                    sym = self.token_to_symbol[tok]
+                    sym_key = self.token_to_symbol[tok]
                     ltp = t.get("last_price")
                     vol = t.get("volume_traded", 0)
-                    if ltp and sym in self.traders:
-                        self.traders[sym].process_tick(ltp, now_ist(), vol)
+                    
+                    if sym_key.startswith("OPT_"):
+                        # Option tick — update last_option_ltp for SL monitoring
+                        real_sym = sym_key[4:]  # Remove "OPT_" prefix
+                        if real_sym in self.traders and ltp:
+                            self.traders[real_sym].last_option_ltp = ltp
+                    elif ltp and sym_key in self.traders:
+                        # Spot tick — process for candle building
+                        self.traders[sym_key].process_tick(ltp, now_ist(), vol)
 
         def on_error(ws, code, reason):
             self._log(f"⚠️ WebSocket error [{code}]: {reason} — will attempt reconnect.")
@@ -891,11 +1092,9 @@ class StockOptionsBot:
             self._log(f"🔄 WebSocket reconnecting... attempt #{attempt}")
 
         def on_noreconnect(ws):
-            self._log("❌ WebSocket exhausted all reconnect attempts — restarting ticker now.")
-            try:
-                self._restart_ticker()
-            except Exception as e:
-                self._log(f"❌ Ticker restart failed: {e}")
+            self._log("❌ WebSocket exhausted all reconnect attempts — setting restart flag.")
+            # Don't restart from WS callback thread (deadlock risk) — let app.py watchdog handle it
+            self._needs_restart = True
 
         self.ticker.on_connect = on_connect
         self.ticker.on_ticks = on_ticks
@@ -906,7 +1105,8 @@ class StockOptionsBot:
         self.ticker.connect(threaded=True)
 
     def _restart_ticker(self):
-        """Hard-restart the KiteTicker when auto-reconnect is exhausted."""
+        """Hard-restart the KiteTicker. MUST be called from main thread, not WS callback."""
+        self._needs_restart = False
         try:
             if self.ticker:
                 self.ticker.close()
@@ -923,6 +1123,15 @@ class StockOptionsBot:
 
     def generate_report(self):
         today = now_ist().strftime("%Y-%m-%d")
+        # Ensure any remaining open positions are force-closed so their P&L enters EOD accounting
+        for sym, tr in self.traders.items():
+            if tr.position is not None:
+                self._log(f"⚠️ [{sym}] Force-closing open position before generating EOD report")
+                try:
+                    tr._close_position("EOD_REPORT_CLOSE")
+                except Exception as e:
+                    self._log(f"❌ Failed to close {sym} before EOD report: {e}")
+
         all_trades = [t for tr in self.traders.values() for t in tr.trades]
         tot_pnl = sum(t.net_pnl for t in all_trades)
         wins = [t for t in all_trades if t.net_pnl > 0]
@@ -952,52 +1161,16 @@ class StockOptionsBot:
         with open(LOG_DIR / f"stocks_report_{today}.json", "w") as f:
             json.dump(report, f, indent=2, default=str)
 
-    def run(self):
-        self.is_running = True
-        print("\n" + "="*70)
-        print(f"🚀 AUTONOMOUS STOCK OPTIONS BOT (Capital: ₹{self.capital_tracker.session_capital:,.0f} | Overall P&L: ₹{self.capital_tracker.overall_pnl:+,.0f})")
-        print("="*70)
-        
-        if not self.authenticate(): return
-        self.load_market_metadata()
-        self.fetch_historical_and_gz()
-        
-        if self.telegram:
-            self.telegram.notify_bot_start(list(STOCKS.keys()), capital_tracker=self.capital_tracker)
-            
-        self.start_live_feed()
-        
-        heartbeat_sent = False
-        pcr_last_updated = None
-        
-        while self.is_running and self.is_market_open():
-            now = now_ist()
-            # 1. PCR update every 15 mins
-            if pcr_last_updated is None or (now - pcr_last_updated).total_seconds() >= 900:
-                for sym in STOCKS.keys():
-                    self.pcr_tracker.update_stock_pcr(sym, self.nfo_df)
-                pcr_last_updated = now
-                
-            # 2. Mid-Day Heartbeat at 12:00 PM IST
-            if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
-                if self.telegram:
-                    status_dict = {s: t.get_diagnostics() for s, t in self.traders.items()}
-                    total_ticks = sum(t.tick_count for t in self.traders.values())
-                    active_pos = sum(1 for t in self.traders.values() if t.position is not None)
-                    self.telegram.notify_midday_heartbeat(status_dict, total_ticks, active_pos)
-                heartbeat_sent = True
-                
-            time.sleep(1)
-            
-        self._log("Market closed. Generating EOD report...")
-        self.generate_report()
-        if self.ticker: self.ticker.close()
-
     def stop(self):
         self.is_running = False
         self.stop_event.set()
+        if self.ticker:
+            try:
+                self.ticker.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    bot = StockOptionsBot()
-    bot.run()
+    from app import run_trading_bot
+    run_trading_bot()
