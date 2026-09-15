@@ -101,19 +101,24 @@ class TelegramNotifier:
     
     def notify_trade_entry(self, security: str, option_type: str, strike: float,
                            entry_price: float, target: float, sl: float,
-                           quantity: int, signal: str):
+                           quantity: int, signal: str, amount_required: Optional[float] = None):
         """Notify new trade entry."""
         is_call = option_type.upper() in ("CE", "CALL") or "BUY" in signal.upper() or "LONG" in signal.upper()
         emoji = "🟢" if is_call else "🔴"
         direction = "BULLISH" if is_call else "BEARISH"
         sl_pct = ((1 - sl / entry_price) * 100) if entry_price > 0 else 0
+        if amount_required is None and entry_price > 0 and quantity > 0:
+            amount_required = quantity * entry_price
+
+        amt_line = f"<b>Amount Required:</b> ₹{amount_required:,.2f}\n" if amount_required else ""
 
         message = (
             f"{emoji} <b>NEW TRADE — {security}</b>\n\n"
             f"<b>Signal:</b> {direction}  |  <b>Type:</b> {option_type} {int(strike)}\n\n"
             f"<b>Entry:</b> ₹{entry_price:.2f}\n"
             f"<b>SL:</b>    ₹{sl:.2f}  (–{sl_pct:.1f}%)\n"
-            f"<b>Qty:</b>   {quantity}\n\n"
+            f"<b>Qty:</b>   {quantity}\n"
+            f"{amt_line}\n"
             f"<b>Time:</b>  {now_ist().strftime('%H:%M')} IST"
         )
         self.send_message(message)
@@ -168,26 +173,35 @@ class TelegramNotifier:
         cap_section = ""
         if capital_summary:
             cap_used = capital_summary.get("capital_used", 100000.0)
-            is_profit = capital_summary.get("is_profit", False)
+            is_base_restored = capital_summary.get("is_base_restored", False)
+            profit_reaped = capital_summary.get("profit_reaped", 0.0)
+            deficit = capital_summary.get("deficit", 0.0)
             day_pnl = capital_summary.get("day_pnl", 0.0)
-            day_pnl_sign = "+" if day_pnl >= 0 else ""
             next_day_cap = capital_summary.get("next_day_capital", 100000.0)
             overall = capital_summary.get("overall_pnl", 0.0)
             overall_sign = "+" if overall >= 0 else ""
             
-            if is_profit:
-                cap_details = (
-                    f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
-                    f"<b>Profit Credited:</b> ₹{day_pnl_sign}{day_pnl:,.2f} (Added to passive income)\n"
-                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Reset to base — profits reaped)\n"
-                    f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
-                )
+            if is_base_restored:
+                if profit_reaped > 0:
+                    cap_details = (
+                        f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
+                        f"<b>Profit Credited:</b> ₹+{profit_reaped:,.2f} (Added to passive income)\n"
+                        f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Reset to base — profits reaped)\n"
+                        f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
+                    )
+                else:
+                    cap_details = (
+                        f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
+                        f"<b>Principal Restored:</b> ₹{next_day_cap:,.2f} (Base capital intact)\n"
+                        f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f}\n"
+                        f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
+                    )
             else:
-                cap_rem = capital_summary.get("capital_remaining", next_day_cap)
+                status_note = f"(Recovering — ₹{deficit:,.2f} below base)" if day_pnl >= 0 else "(Loss carried forward)"
                 cap_details = (
                     f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
-                    f"<b>Capital Remaining:</b> ₹{cap_rem:,.2f}\n"
-                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Loss carried forward)\n"
+                    f"<b>Capital Remaining:</b> ₹{next_day_cap:,.2f}\n"
+                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} {status_note}\n"
                     f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
                 )
             cap_section = f"\n━━━━━━━━━━━━━━━━━━━━━━\n{cap_details}\n━━━━━━━━━━━━━━━━━━━━━━\n"

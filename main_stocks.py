@@ -198,10 +198,22 @@ class CapitalTracker:
         self.load_state()
 
     def load_state(self):
-        # 1. Environment variable override if specified
+        # 1. Local state file persistence (authoritative for active container)
+        if self.state_file.exists():
+            try:
+                data = json.loads(self.state_file.read_text())
+                self.session_capital = float(data.get("session_capital", self.base_capital))
+                self.overall_pnl = float(data.get("overall_pnl", 0.0))
+                os.environ["SESSION_CAPITAL"] = str(self.session_capital)
+                os.environ["OVERALL_PNL"] = str(self.overall_pnl)
+                self.logger(f"💼 Capital state loaded: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+                return
+            except Exception as e:
+                self.logger(f"⚠️ Error reading capital_state.json: {e}. Checking ENV fallback...")
+
+        # 2. Environment variable fallback (used on fresh container deploy where local disk was wiped)
         env_session = os.environ.get("SESSION_CAPITAL")
         env_overall = os.environ.get("OVERALL_PNL")
-        
         if env_session is not None or env_overall is not None:
             if env_session:
                 try: self.session_capital = float(env_session)
@@ -210,25 +222,18 @@ class CapitalTracker:
                 try: self.overall_pnl = float(env_overall)
                 except: pass
             self.logger(f"💼 Capital initialized from ENV: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+            self.save_state()
             return
             
-        # 2. Local state file persistence
-        if self.state_file.exists():
-            try:
-                data = json.loads(self.state_file.read_text())
-                self.session_capital = float(data.get("session_capital", self.base_capital))
-                self.overall_pnl = float(data.get("overall_pnl", 0.0))
-                self.logger(f"💼 Capital state loaded: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
-            except Exception as e:
-                self.logger(f"⚠️ Error reading capital_state.json: {e}. Defaulting to ₹{self.base_capital:,.2f}")
-                self.session_capital = self.base_capital
-                self.overall_pnl = 0.0
-        else:
-            self.session_capital = self.base_capital
-            self.overall_pnl = 0.0
-            self.save_state()
+        self.session_capital = self.base_capital
+        self.overall_pnl = 0.0
+        self.save_state()
 
     def save_state(self):
+        # Keep in-process os.environ in sync so re-instantiations within same container stay aligned
+        os.environ["SESSION_CAPITAL"] = str(self.session_capital)
+        os.environ["OVERALL_PNL"] = str(self.overall_pnl)
+
         # 1. Save to local file (fast, for same-container restarts)
         try:
             data = {
@@ -316,29 +321,43 @@ class CapitalTracker:
 
     def end_day(self, day_net_pnl: float) -> dict:
         """
-        Processes End-of-Day P&L:
-        - If profit:
-            - overall_pnl += day_net_pnl (Passive income credited)
-            - tomorrow's session_capital = base_capital (₹1L) (Profits reaped)
-        - If loss:
-            - overall_pnl += day_net_pnl
-            - tomorrow's session_capital = max(0.0, session_capital + day_net_pnl) (Loss carried forward)
+        Processes End-of-Day P&L with two-tier principal recovery:
+        1. Principal is calculated first:
+           new_capital = session_capital + day_net_pnl
+        2. If new_capital >= base_capital:
+           - Principal is fully intact/restored to base_capital (₹1.0L).
+           - Excess above base is profit reaped: profit_reaped = new_capital - base_capital.
+           - Tomorrow starts at base_capital.
+        3. If new_capital < base_capital:
+           - Principal is still in deficit (loss carried forward or partial recovery).
+           - No profit is reaped (profit_reaped = 0.0).
+           - Tomorrow starts at new_capital (recovering counter).
+        4. Overall P&L accumulates continuously:
+           overall_pnl += day_net_pnl
         """
         capital_used = self.session_capital
         self.overall_pnl += day_net_pnl
+        new_capital = self.session_capital + day_net_pnl
         
-        is_profit = day_net_pnl >= 0
-        if is_profit:
+        if new_capital >= self.base_capital:
             next_day_capital = self.base_capital
-            capital_remaining = self.session_capital + day_net_pnl
+            profit_reaped = new_capital - self.base_capital
+            is_base_restored = True
         else:
-            next_day_capital = max(0.0, self.session_capital + day_net_pnl)
-            capital_remaining = next_day_capital
+            next_day_capital = max(0.0, new_capital)
+            profit_reaped = 0.0
+            is_base_restored = False
             
+        capital_remaining = next_day_capital
+        deficit = max(0.0, self.base_capital - next_day_capital)
+        
         summary = {
             "capital_used": capital_used,
             "day_pnl": day_net_pnl,
-            "is_profit": is_profit,
+            "is_profit": is_base_restored and profit_reaped > 0,
+            "is_base_restored": is_base_restored,
+            "profit_reaped": profit_reaped,
+            "deficit": deficit,
             "capital_remaining": capital_remaining,
             "next_day_capital": next_day_capital,
             "overall_pnl": self.overall_pnl,
@@ -771,14 +790,16 @@ class StockTrader:
         
         emoji = "🟢" if signal_type == "BUY" else "🔴"
         gz_tag = "2 LOTS (Golden Zone Confluence)" if in_gz and lot_mult == 2 else "1 LOT (Standard)"
+        trade_amount = qty * entry_price
         print(f"\n{'='*60}", flush=True)
         print(f"{emoji} [{self.symbol} ENTRY] {contract['tradingsymbol']} | {gz_tag}", flush=True)
-        print(f"   Entry LTP: ₹{entry_price:.2f} | Stop-Loss: ₹{sl:.2f} | Quantity: {qty}", flush=True)
+        print(f"   Entry LTP: ₹{entry_price:.2f} | Stop-Loss: ₹{sl:.2f} | Quantity: {qty} | Amount Required: ₹{trade_amount:,.2f}", flush=True)
         print(f"{'='*60}\n", flush=True)
         
         if self.telegram:
             self.telegram.notify_trade_entry(
-                self.symbol, opt_type, contract["strike"], entry_price, 0, sl, qty, f"{signal_type} ({gz_tag})"
+                self.symbol, opt_type, contract["strike"], entry_price, 0, sl, qty, f"{signal_type} ({gz_tag})",
+                amount_required=trade_amount
             )
 
     def _check_exit(self, current_spot: float):
@@ -1054,11 +1075,13 @@ class StockOptionsBot:
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
         tokens = list(self.token_to_symbol.keys())
         self._last_tick_time = None  # Set only when first real tick arrives
+        self._feed_start_time = now_ist()  # Set immediately on feed launch so watchdog tracks connection time
+        self._log(f"📡 Initializing WebSocket feed for {len(tokens)} tokens: {tokens}")
 
         def on_connect(ws, resp):
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
-            self._feed_start_time = now_ist()  # Mark when feed actually connected
+            self._feed_start_time = now_ist()  # Refresh on successful connection
             self._log(f"✅ WebSocket connected — subscribed to {len(tokens)} stock tokens.")
             
         def on_ticks(ws, ticks):
